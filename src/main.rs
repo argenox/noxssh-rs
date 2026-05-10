@@ -225,7 +225,7 @@ impl SshClient {
             c2s_cipher: None,
             s2c_cipher: None,
             host_key_policy: KnownHostsPolicy {
-                mode: HostKeyCheckingMode::Strict,
+                mode: HostKeyCheckingMode::Ask,
                 path: default_known_hosts_path(),
                 batch_mode: false,
             },
@@ -609,6 +609,8 @@ impl SshClient {
         out_max: usize,
         timeout_ms: u64,
     ) -> Result<Option<Vec<u8>>, SshError> {
+        // Windows rejects `set_read_timeout(Some(0))` ("cannot set a 0 duration timeout").
+        let timeout_ms = timeout_ms.max(1);
         let old = self.stream.read_timeout()?;
         self.stream
             .set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
@@ -627,6 +629,7 @@ impl SshClient {
     }
 
     fn recv_packet_with_timeout(&mut self, timeout_ms: u64) -> Result<Option<Vec<u8>>, SshError> {
+        let timeout_ms = timeout_ms.max(1);
         let old = self.stream.read_timeout()?;
         self.stream
             .set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
@@ -1944,6 +1947,8 @@ struct CliOptions {
     request_pty: bool,
     debug_level: u8,
     host_key_mode: HostKeyCheckingMode,
+    /// When true, do not overwrite host key mode from `~/.ssh/config`.
+    host_key_mode_explicit: bool,
     known_hosts_path: Option<PathBuf>,
     batch_mode: bool,
     connect_timeout_ms: u64,
@@ -1990,8 +1995,9 @@ fn print_usage(program: &str) {
     println!("                 Identity file path (public key probing and future key auth).");
     println!("  -o key=value   OpenSSH-style options (limited support).");
     println!("  -F none        Disable loading ~/.ssh/config.");
-    println!("  --strict-host-key-checking <strict|accept-new|off>");
-    println!("                 Host key verification policy (default: strict).");
+    println!("  --strict-host-key-checking <strict|ask|accept-new|off>");
+    println!("                 Host key policy (default: ask). ask=prompt on new keys; accept-new=auto-add;");
+    println!("                 strict=fail on unknown hosts (no prompt).");
     println!("  --known-hosts <path>");
     println!("                 Path to known_hosts file.");
     println!("  --connect-timeout-ms <ms>");
@@ -2028,6 +2034,7 @@ fn parse_openssh_option(option: &str, opts: &mut CliOptions) -> Result<(), SshEr
         "StrictHostKeyChecking" => {
             opts.host_key_mode = HostKeyCheckingMode::parse(&value.to_ascii_lowercase())
                 .ok_or(SshError::BadParam("invalid StrictHostKeyChecking value"))?;
+            opts.host_key_mode_explicit = true;
         }
         "UserKnownHostsFile" => {
             opts.known_hosts_path = Some(PathBuf::from(value));
@@ -2067,7 +2074,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, SshError> {
     let mut opts = CliOptions {
         port: NETNOX_SSH_DEFAULT_PORT,
         request_pty: true,
-        host_key_mode: HostKeyCheckingMode::Strict,
+        host_key_mode: HostKeyCheckingMode::Ask,
         connect_timeout_ms: 10_000,
         read_timeout_ms: 30_000,
         rekey_interval_s: 3_600,
@@ -2152,6 +2159,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, SshError> {
                 }
                 opts.host_key_mode = HostKeyCheckingMode::parse(&args[i + 1])
                     .ok_or(SshError::BadParam("invalid host key checking mode"))?;
+                opts.host_key_mode_explicit = true;
                 i += 2;
             }
             "--known-hosts" => {
@@ -2269,7 +2277,7 @@ fn apply_ssh_host_config(opts: &mut CliOptions, username: &mut String, host: &st
     if opts.identity_files.is_empty() && !host_cfg.identity_files.is_empty() {
         opts.identity_files = host_cfg.identity_files;
     }
-    if opts.host_key_mode == HostKeyCheckingMode::Strict {
+    if !opts.host_key_mode_explicit {
         if let Some(mode) = host_cfg.strict_host_key_checking {
             opts.host_key_mode = mode;
         }
@@ -2372,7 +2380,13 @@ fn print_channel_output(client: &mut SshClient) -> Result<(), SshError> {
     }
 }
 
-fn drain_shell_output(client: &mut SshClient, first_wait_ms: u64) -> Result<i32, SshError> {
+/// Pull remote shell output. `first_wait_ms` / `follow_wait_ms` are passed to socket reads; a value
+/// of `0` is treated as **1 ms** internally so Windows accepts the timeout (zero is invalid there).
+fn drain_shell_output(
+    client: &mut SshClient,
+    first_wait_ms: u64,
+    follow_wait_ms: u64,
+) -> Result<i32, SshError> {
     match client.recv_data_with_timeout(NETNOX_SSH_MAX_DATA_LEN, first_wait_ms)? {
         None => {
             client.maybe_send_keepalive()?;
@@ -2383,7 +2397,7 @@ fn drain_shell_output(client: &mut SshClient, first_wait_ms: u64) -> Result<i32,
             io::stdout().write_all(&data)?;
             io::stdout().flush()?;
             loop {
-                match client.recv_data_with_timeout(NETNOX_SSH_MAX_DATA_LEN, 60)? {
+                match client.recv_data_with_timeout(NETNOX_SSH_MAX_DATA_LEN, follow_wait_ms)? {
                     None => break,
                     Some(next) if next.is_empty() => return Ok(1),
                     Some(next) => {
@@ -2398,50 +2412,67 @@ fn drain_shell_output(client: &mut SshClient, first_wait_ms: u64) -> Result<i32,
 }
 
 fn interactive_shell(client: &mut SshClient) -> Result<(), SshError> {
-    println!("Interactive shell mode. Type 'exit' to quit.");
+    println!("Interactive shell (each key is sent to the server; Ctrl+C sends interrupt).");
     terminal::enable_raw_mode().map_err(|_| SshError::Failed("failed to enable raw mode"))?;
     if let Ok((cols, rows)) = terminal::size() {
         let _ = client.send_window_change(cols as u32, rows as u32);
     }
-    let mut line_buf = String::new();
     let result = (|| -> Result<(), SshError> {
         loop {
-            let drain = drain_shell_output(client, 100)?;
-            if drain < 0 {
-                return Err(SshError::Failed("failed receiving shell output"));
-            }
+            // Short first read so we do not block ~100ms before every key poll (felt sluggish).
+            let drain = drain_shell_output(client, 1, 0)?;
             if drain > 0 {
                 println!("Remote channel closed.");
                 return Ok(());
             }
 
-            if !event::poll(Duration::from_millis(50))
+            if !event::poll(Duration::from_millis(1))
                 .map_err(|_| SshError::Failed("event polling failed"))?
             {
+                // Idle: tiny sleep avoids a tight spin when there is no network data and no keys.
+                std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
 
             match event::read().map_err(|_| SshError::Failed("event read failed"))? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Enter => {
-                        if line_buf == "exit" {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // Raw mode turns off local echo; forward bytes immediately so the remote PTY
+                    // can echo (same model as OpenSSH). Line-buffering here meant nothing was sent
+                    // until Enter, so nothing appeared while typing.
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    match key.code {
+                        KeyCode::Char('c') if ctrl => client.send_data(&[0x03])?,
+                        KeyCode::Char('d') if ctrl => client.send_data(&[0x04])?,
+                        KeyCode::Char('z') if ctrl => client.send_data(&[0x1a])?,
+                        KeyCode::Char('l') if ctrl => client.send_data(&[0x0c])?,
+                        KeyCode::Char(ch) => {
+                            let mut utf8_buf = [0u8; 4];
+                            let seq = ch.encode_utf8(&mut utf8_buf);
+                            client.send_data(seq.as_bytes())?;
+                        }
+                        KeyCode::Enter => client.send_data(b"\r")?,
+                        KeyCode::Tab => client.send_data(b"\t")?,
+                        KeyCode::Backspace | KeyCode::Delete => client.send_data(&[0x7f])?,
+                        KeyCode::Home => client.send_data(b"\x1b[H")?,
+                        KeyCode::End => client.send_data(b"\x1b[F")?,
+                        KeyCode::Up => client.send_data(b"\x1b[A")?,
+                        KeyCode::Down => client.send_data(b"\x1b[B")?,
+                        KeyCode::Right => client.send_data(b"\x1b[C")?,
+                        KeyCode::Left => client.send_data(b"\x1b[D")?,
+                        KeyCode::PageUp => client.send_data(b"\x1b[5~")?,
+                        KeyCode::PageDown => client.send_data(b"\x1b[6~")?,
+                        KeyCode::Insert => client.send_data(b"\x1b[2~")?,
+                        _ => {}
+                    }
+                    // Pull echo without waiting for the next main-loop network poll.
+                    match drain_shell_output(client, 0, 0)? {
+                        1 => {
+                            println!("Remote channel closed.");
                             return Ok(());
                         }
-                        line_buf.push('\n');
-                        client.send_data(line_buf.as_bytes())?;
-                        line_buf.clear();
+                        _ => {}
                     }
-                    KeyCode::Backspace => {
-                        line_buf.pop();
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        client.send_data(&[0x03])?;
-                    }
-                    KeyCode::Char(ch) => {
-                        line_buf.push(ch);
-                    }
-                    _ => {}
-                },
+                }
                 Event::Resize(cols, rows) => {
                     let _ = client.send_window_change(cols as u32, rows as u32);
                 }

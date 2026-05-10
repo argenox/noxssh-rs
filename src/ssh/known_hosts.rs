@@ -5,14 +5,18 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostKeyCheckingMode {
+    /// Refuse unknown hosts without prompting (CI / locked-down use).
     Strict,
+    /// Prompt on unknown host when stdin is a TTY; refuse on key mismatch (OpenSSH `ask`).
+    Ask,
+    /// Silently add new host keys; refuse if the key changed (OpenSSH `accept-new`).
     AcceptNew,
     Off,
 }
 
 impl Default for HostKeyCheckingMode {
     fn default() -> Self {
-        Self::Strict
+        Self::Ask
     }
 }
 
@@ -20,6 +24,7 @@ impl HostKeyCheckingMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "strict" | "yes" => Some(Self::Strict),
+            "ask" => Some(Self::Ask),
             "accept-new" => Some(Self::AcceptNew),
             "off" | "no" => Some(Self::Off),
             _ => None,
@@ -88,25 +93,34 @@ pub fn verify_or_add_host_key(
         ));
     }
 
-    if policy.mode == HostKeyCheckingMode::Strict {
-        return Err(format!(
-            "unknown host key for {hostname}; add it to {} or use accept-new/off",
-            policy.path.display()
-        ));
+    // Unknown host: behavior depends on mode (OpenSSH-aligned).
+    match policy.mode {
+        HostKeyCheckingMode::Strict => {
+            return Err(format!(
+                "unknown host key for {hostname}; add it to {} or use -o StrictHostKeyChecking=ask|accept-new|off",
+                policy.path.display()
+            ));
+        }
+        HostKeyCheckingMode::AcceptNew => {
+            append_known_host_line(hostname, key_type, key_data_b64, &policy.path)
+                .map_err(|err| format!("failed to update known_hosts: {err}"))?;
+        }
+        HostKeyCheckingMode::Ask => {
+            if policy.batch_mode || !io::stdin().is_terminal() {
+                return Err(format!(
+                    "unknown host key for {hostname}; stdin is not a terminal (use --strict-host-key-checking accept-new, or add the key to {})",
+                    policy.path.display()
+                ));
+            }
+            if !prompt_trust_new_host(hostname, key_type, key_data_b64)? {
+                return Err("user rejected new host key".to_string());
+            }
+            append_known_host_line(hostname, key_type, key_data_b64, &policy.path)
+                .map_err(|err| format!("failed to update known_hosts: {err}"))?;
+        }
+        HostKeyCheckingMode::Off => {}
     }
 
-    if policy.batch_mode || !io::stdin().is_terminal() {
-        return Err(format!(
-            "unknown host key for {hostname} in non-interactive mode"
-        ));
-    }
-
-    if !prompt_trust_new_host(hostname, key_type, key_data_b64)? {
-        return Err("user rejected new host key".to_string());
-    }
-
-    append_known_host_line(hostname, key_type, key_data_b64, &policy.path)
-        .map_err(|err| format!("failed to update known_hosts: {err}"))?;
     Ok(())
 }
 
@@ -128,9 +142,9 @@ fn host_field_matches(hosts_field: &str, hostname: &str) -> bool {
 
 fn prompt_trust_new_host(hostname: &str, key_type: &str, key_data_b64: &str) -> Result<bool, String> {
     println!("The authenticity of host '{hostname}' can't be established.");
-    println!("Server key type: {key_type}");
-    println!("Server key (base64): {key_data_b64}");
-    print!("Add this host to known_hosts? (yes/no): ");
+    println!("{key_type} key fingerprint is {key_data_b64}.");
+    println!("This key is not known by any other names.");
+    print!("Are you sure you want to continue connecting (yes/no)? ");
     io::stdout()
         .flush()
         .map_err(|err| format!("stdout flush failed: {err}"))?;
@@ -155,4 +169,15 @@ fn append_known_host_line(
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{hostname} {key_type} {key_data_b64}")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_modes_including_ask() {
+        assert_eq!(HostKeyCheckingMode::parse("ask"), Some(HostKeyCheckingMode::Ask));
+        assert_eq!(HostKeyCheckingMode::default(), HostKeyCheckingMode::Ask);
+    }
 }

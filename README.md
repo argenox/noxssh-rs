@@ -17,7 +17,7 @@
 - **Password authentication** — `ssh-userauth` with the `password` method
 - **Session channel** — Open `session` channel, **remote exec** or **interactive shell**
 - **PTY** — Optional `pty-req` before shell (disable with `-T`, similar to OpenSSH)
-- **Host key policy** — `known_hosts` verification with `strict`, `accept-new`, and `off` modes
+- **Host key policy** — `known_hosts` verification: default **`ask`** (prompt to trust new hosts on a TTY), plus **`strict`**, **`accept-new`** (auto-add new keys), and **`off`**
 - **OpenSSH config compatibility (core)** — supports key directives from `~/.ssh/config` and `-o key=value` options
 - **Local forwarding** — `-L [bind_port:]host:hostport` via SSH `direct-tcpip`
 - **SFTP roundtrip** — `--sftp-ls <path>` initializes SFTP subsystem and lists canonical path entries
@@ -74,7 +74,7 @@ noxssh [-h] [-V] [-d|-dd|-ddd] [-T] [-p port] [-w password] [-i identity_file] [
 | `--sftp-ls path` | Start SFTP subsystem and print canonical path entries |
 | `-T` | Do not request a PTY for shell mode |
 | `-d`, `-dd`, `-ddd` | Debug verbosity (`NETNOX_SSH_DEBUG` for compatibility) |
-| `--strict-host-key-checking` | `strict`, `accept-new`, or `off` host key behavior |
+| `--strict-host-key-checking` | `strict`, `ask` (default), `accept-new`, or `off` (also `yes`/`no`) |
 | `--known-hosts path` | Override `known_hosts` file path |
 | `--connect-timeout-ms`, `--read-timeout-ms` | Network timeout controls |
 | `--server-alive-interval` | Keepalive interval in seconds |
