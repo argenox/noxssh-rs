@@ -1,0 +1,98 @@
+name: Build Binaries
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_suffix: ""
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            bin_suffix: ""
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            bin_suffix: ""
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_suffix: ".exe"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure submodule URL for CI token auth
+        run: |
+          git config -f .gitmodules submodule.noxtls.url https://github.com/argenox/noxtls-rust-private.git
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Resolve app version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [[ -z "$VERSION" ]]; then
+            echo "Failed to determine version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Prepare versioned binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          SOURCE="target/${{ matrix.target }}/release/noxssh${{ matrix.bin_suffix }}"
+          DEST="dist/noxssh-v${{ steps.version.outputs.value }}-${{ matrix.target }}${{ matrix.bin_suffix }}"
+          cp "$SOURCE" "$DEST"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: noxssh-v${{ steps.version.outputs.value }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release Assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish release files
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/**/*

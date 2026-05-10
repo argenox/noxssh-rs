@@ -1,0 +1,9 @@
+[package]
+name = "noxssh"
+version = "0.1.10"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+noxtls-crypto = { path = "noxtls/crates/noxtls-crypto" }
+rpassword = "7"
