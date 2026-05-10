@@ -1,7 +1,7 @@
 use noxtls_crypto::{
-    hmac_sha256, rsassa_sha256_sign, sha256, x25519_generate_private_key_auto, AesCipher,
-    Ed25519PrivateKey, HmacDrbgSha256,
-    X25519PublicKey,
+    aes_cbc_decrypt, aes_ctr_apply, bcrypt_pbkdf_sha512, hmac_sha256, rsassa_sha256_sign, sha256,
+    mlkem_decapsulate, mlkem_generate_keypair_auto, AesCipher, Ed25519PrivateKey, HmacDrbgSha256,
+    RsaPrivateKey, x25519_generate_private_key_auto, X25519PublicKey,
 };
 use noxtls_x509::{
     parse_pkcs8_private_key_info_der, private_key_pem_to_der_pkcs8, rsa_private_key_from_pem_pkcs1,
@@ -44,12 +44,15 @@ const NETNOX_SSH_KEXINIT_COOKIE_LEN: usize = 16;
 const NETNOX_SSH_AES_BLOCK_LEN: usize = 16;
 const NETNOX_SSH_MAC_LEN: usize = 32;
 
-const NETNOX_SSH_KEX_ALG_LIST: &str = "curve25519-sha256,diffie-hellman-group14-sha256";
+const NETNOX_SSH_KEX_ALG_LIST: &str =
+    "mlkem768x25519-sha256,mlkem768-sha256,curve25519-sha256,diffie-hellman-group14-sha256";
 const NETNOX_SSH_HOST_KEY_ALG_LIST: &str = "ssh-ed25519,rsa-sha2-256,ssh-rsa";
 const NETNOX_SSH_CIPHER_ALG_LIST: &str = "aes128-ctr,aes256-ctr,chacha20-poly1305@openssh.com";
 const NETNOX_SSH_MAC_ALG_LIST: &str = "hmac-sha2-256,hmac-sha1";
 const NETNOX_SSH_COMPRESSION_ALG_LIST: &str = "none";
 const NETNOX_SSH_REQUIRED_KEX_ALG: &str = "curve25519-sha256";
+const SSH_KEX_MLKEM768_HYBRID: &str = "mlkem768x25519-sha256";
+const SSH_KEX_MLKEM768_NATIVE: &str = "mlkem768-sha256";
 
 // SSH message numbers (RFC 4250+).
 const MSG_SERVICE_REQUEST: u8 = 5;
@@ -115,6 +118,13 @@ impl From<io::Error> for SshError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KexAlgorithm {
+    Curve25519Sha256,
+    MlKem768Sha256,
+    MlKem768X25519Sha256,
 }
 
 struct SshClient {
@@ -722,9 +732,13 @@ impl SshClient {
             return Err(SshError::Failed("server kexinit too large"));
         }
         self.kexinit_server_payload = rx_payload.clone();
-        validate_server_kexinit(&rx_payload)?;
+        let selected_kex = select_kex_algorithm(&rx_payload)?;
         self.kexinit_exchanged = true;
-        self.perform_curve25519_kex()
+        match selected_kex {
+            KexAlgorithm::Curve25519Sha256 => self.perform_curve25519_kex(),
+            KexAlgorithm::MlKem768Sha256 => self.perform_mlkem_native_kex(),
+            KexAlgorithm::MlKem768X25519Sha256 => self.perform_mlkem_x25519_hybrid_kex(),
+        }
     }
 
     fn perform_curve25519_kex(&mut self) -> Result<(), SshError> {
@@ -789,6 +803,145 @@ impl SshClient {
             return Err(SshError::Failed("expected newkeys"));
         }
 
+        self.derive_transport_keys()?;
+        self.key_exchange_complete = true;
+        Ok(())
+    }
+
+    fn perform_mlkem_native_kex(&mut self) -> Result<(), SshError> {
+        let mut drbg = new_drbg()?;
+        let (mlkem_private, mlkem_public) = mlkem_generate_keypair_auto(&mut drbg)
+            .map_err(|_| SshError::Failed("mlkem key generation failed"))?;
+
+        let mut init_payload = Vec::new();
+        init_payload.push(MSG_KEX_ECDH_INIT);
+        push_ssh_string(&mut init_payload, mlkem_public.as_bytes());
+        self.send_packet(&init_payload)?;
+
+        let reply = self.wait_for_message(MSG_KEX_ECDH_REPLY, None)?;
+        if reply.is_empty() || reply[0] != MSG_KEX_ECDH_REPLY {
+            return Err(SshError::Failed("invalid mlkem kex reply"));
+        }
+
+        let mut off = 1usize;
+        let host_key_blob = read_ssh_string_owned(&reply, &mut off)?;
+        let server_ct = read_ssh_string_owned(&reply, &mut off)?;
+        let signature = read_ssh_string_owned(&reply, &mut off)?;
+        if signature.is_empty() {
+            return Err(SshError::Failed("invalid mlkem kex reply fields"));
+        }
+        let host_key_type =
+            ssh_host_key_type_from_blob(&host_key_blob).ok_or(SshError::Failed("invalid host key blob"))?;
+        let host_key_b64 = base64_encode(&host_key_blob);
+        verify_or_add_host_key(
+            &self.host,
+            &host_key_type,
+            &host_key_b64,
+            &self.host_key_policy,
+        )
+        .map_err(SshError::FailedOwned)?;
+
+        let mlkem_shared = mlkem_decapsulate(&mlkem_private, &server_ct)
+            .map_err(|_| SshError::Failed("mlkem decapsulation failed"))?;
+        self.session_id = compute_exchange_hash(
+            &self.client_ident,
+            &self.server_ident,
+            &self.kexinit_client_payload,
+            &self.kexinit_server_payload,
+            &host_key_blob,
+            mlkem_public.as_bytes(),
+            &server_ct,
+            &mlkem_shared,
+        )?;
+        self.session_id_len = 32;
+        self.shared_secret_raw.copy_from_slice(&mlkem_shared);
+
+        self.send_packet(&[MSG_NEWKEYS])?;
+        let newkeys = self.wait_for_message(MSG_NEWKEYS, None)?;
+        if newkeys.first().copied() != Some(MSG_NEWKEYS) {
+            return Err(SshError::Failed("expected newkeys"));
+        }
+        self.derive_transport_keys()?;
+        self.key_exchange_complete = true;
+        Ok(())
+    }
+
+    fn perform_mlkem_x25519_hybrid_kex(&mut self) -> Result<(), SshError> {
+        let mut drbg = new_drbg()?;
+        let x_priv = x25519_generate_private_key_auto(&mut drbg)
+            .map_err(|_| SshError::Failed("x25519 key generation failed"))?;
+        let x_pub = x_priv.public_key().bytes;
+        let (mlkem_private, mlkem_public) = mlkem_generate_keypair_auto(&mut drbg)
+            .map_err(|_| SshError::Failed("mlkem key generation failed"))?;
+
+        let mut combined_init = Vec::new();
+        push_ssh_string(&mut combined_init, &x_pub);
+        push_ssh_string(&mut combined_init, mlkem_public.as_bytes());
+
+        let mut init_payload = Vec::new();
+        init_payload.push(MSG_KEX_ECDH_INIT);
+        push_ssh_string(&mut init_payload, &combined_init);
+        self.send_packet(&init_payload)?;
+
+        let reply = self.wait_for_message(MSG_KEX_ECDH_REPLY, None)?;
+        if reply.is_empty() || reply[0] != MSG_KEX_ECDH_REPLY {
+            return Err(SshError::Failed("invalid hybrid kex reply"));
+        }
+        let mut off = 1usize;
+        let host_key_blob = read_ssh_string_owned(&reply, &mut off)?;
+        let server_combo = read_ssh_string_owned(&reply, &mut off)?;
+        let signature = read_ssh_string_owned(&reply, &mut off)?;
+        if signature.is_empty() {
+            return Err(SshError::Failed("invalid hybrid kex reply fields"));
+        }
+        let host_key_type =
+            ssh_host_key_type_from_blob(&host_key_blob).ok_or(SshError::Failed("invalid host key blob"))?;
+        let host_key_b64 = base64_encode(&host_key_blob);
+        verify_or_add_host_key(
+            &self.host,
+            &host_key_type,
+            &host_key_b64,
+            &self.host_key_policy,
+        )
+        .map_err(SshError::FailedOwned)?;
+
+        let mut soff = 0usize;
+        let server_x25519 = read_ssh_string(&server_combo, &mut soff)?;
+        let server_mlkem_ct = read_ssh_string(&server_combo, &mut soff)?;
+        if soff != server_combo.len() || server_x25519.len() != 32 {
+            return Err(SshError::Failed("invalid hybrid server payload"));
+        }
+        let mut server_x_pub = [0u8; 32];
+        server_x_pub.copy_from_slice(server_x25519);
+        let x_shared = x_priv
+            .diffie_hellman_checked(X25519PublicKey::from_bytes(server_x_pub))
+            .map_err(|_| SshError::Failed("x25519 shared secret failed"))?;
+        let mlkem_shared = mlkem_decapsulate(&mlkem_private, server_mlkem_ct)
+            .map_err(|_| SshError::Failed("mlkem decapsulation failed"))?;
+
+        let mut hybrid_material = Vec::with_capacity(64);
+        hybrid_material.extend_from_slice(&x_shared);
+        hybrid_material.extend_from_slice(&mlkem_shared);
+        let hybrid_shared = sha256(&hybrid_material);
+
+        self.session_id = compute_exchange_hash(
+            &self.client_ident,
+            &self.server_ident,
+            &self.kexinit_client_payload,
+            &self.kexinit_server_payload,
+            &host_key_blob,
+            &combined_init,
+            &server_combo,
+            &hybrid_shared,
+        )?;
+        self.session_id_len = 32;
+        self.shared_secret_raw.copy_from_slice(&hybrid_shared);
+
+        self.send_packet(&[MSG_NEWKEYS])?;
+        let newkeys = self.wait_for_message(MSG_NEWKEYS, None)?;
+        if newkeys.first().copied() != Some(MSG_NEWKEYS) {
+            return Err(SshError::Failed("expected newkeys"));
+        }
         self.derive_transport_keys()?;
         self.key_exchange_complete = true;
         Ok(())
@@ -879,6 +1032,13 @@ impl SshClient {
     }
 
     fn try_password_auth(&mut self) -> Result<bool, SshError> {
+        if self.password.is_empty() {
+            if self.host_key_policy.batch_mode {
+                return Ok(false);
+            }
+            let entered = prompt_password()?;
+            self.set_password(&entered)?;
+        }
         self.send_userauth_password()?;
         let payload = self.wait_for_message(MSG_USERAUTH_SUCCESS, Some(MSG_USERAUTH_FAILURE))?;
         match payload.first().copied() {
@@ -897,9 +1057,16 @@ impl SshClient {
         }
         let identity_files = self.identity_files.clone();
         for identity in identity_files {
+            let mut candidates: Vec<(String, Vec<u8>)> = Vec::new();
             if let Some((algorithm, public_key_b64)) = read_public_key_line(&identity) {
                 let pub_blob = base64_decode(&public_key_b64)
                     .ok_or(SshError::Failed("invalid base64 in identity public key"))?;
+                candidates.push((algorithm, pub_blob));
+            } else if let Some(derived) = derive_publickey_candidate_from_private(&identity)? {
+                candidates.push(derived);
+            }
+
+            for (algorithm, pub_blob) in candidates {
                 if !matches!(
                     algorithm.as_str(),
                     "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" | "ssh-ed25519"
@@ -909,8 +1076,7 @@ impl SshClient {
                 if !send_publickey_probe(self, &algorithm, &pub_blob)? {
                     continue;
                 }
-                if let Some(sig) = sign_publickey_auth_request(self, &identity, &algorithm, &pub_blob)?
-                {
+                if let Some(sig) = sign_publickey_auth_request(self, &identity, &algorithm, &pub_blob)? {
                     send_signed_publickey_request(self, &algorithm, &pub_blob, &sig)?;
                     let rsp = self.wait_for_message(MSG_USERAUTH_SUCCESS, Some(MSG_USERAUTH_FAILURE))?;
                     match rsp.first().copied() {
@@ -1168,9 +1334,9 @@ fn compute_exchange_hash(
     kexinit_client_payload: &[u8],
     kexinit_server_payload: &[u8],
     host_key_blob: &[u8],
-    client_pub: &[u8; 32],
-    server_pub: &[u8; 32],
-    shared_secret_raw: &[u8; 32],
+    client_pub: &[u8],
+    server_pub: &[u8],
+    shared_secret_raw: &[u8],
 ) -> Result<[u8; 32], SshError> {
     // H = HASH(V_C || V_S || I_C || I_S || K_S || Q_C || Q_S || K)
     let mut input = Vec::with_capacity(4096);
@@ -1284,6 +1450,25 @@ fn read_public_key_line(identity_path: &PathBuf) -> Option<(String, String)> {
     None
 }
 
+fn derive_publickey_candidate_from_private(
+    identity_path: &PathBuf,
+) -> Result<Option<(String, Vec<u8>)>, SshError> {
+    let pem = match std::fs::read_to_string(identity_path) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    match load_private_signer(&pem, Some(identity_path))? {
+        PrivateSigner::Ed25519(private_key) => {
+            let public = private_key.verifying_key().to_bytes();
+            let mut pub_blob = Vec::new();
+            push_ssh_string(&mut pub_blob, b"ssh-ed25519");
+            push_ssh_string(&mut pub_blob, &public);
+            Ok(Some(("ssh-ed25519".to_string(), pub_blob)))
+        }
+        PrivateSigner::Rsa(_) => Ok(None),
+    }
+}
+
 fn send_publickey_probe(client: &mut SshClient, algorithm: &str, pub_blob: &[u8]) -> Result<bool, SshError> {
     let mut payload = Vec::with_capacity(1024);
     payload.push(MSG_USERAUTH_REQUEST);
@@ -1327,7 +1512,7 @@ fn sign_publickey_auth_request(
     push_ssh_string(&mut signed_data, algorithm.as_bytes());
     push_ssh_string(&mut signed_data, pub_blob);
 
-    match load_private_signer(&pem)? {
+    match load_private_signer(&pem, Some(identity_path))? {
         PrivateSigner::Rsa(private_key) => {
             let raw_sig = rsassa_sha256_sign(&private_key, &signed_data)
                 .map_err(|_| SshError::Failed("rsa-sha256 signing failed"))?;
@@ -1382,11 +1567,15 @@ fn try_agent_publickey_auth(_client: &mut SshClient) -> Result<bool, SshError> {
 }
 
 enum PrivateSigner {
-    Rsa(noxtls_crypto::RsaPrivateKey),
+    Rsa(RsaPrivateKey),
     Ed25519(Ed25519PrivateKey),
 }
 
-fn load_private_signer(pem: &str) -> Result<PrivateSigner, SshError> {
+fn load_private_signer(pem: &str, identity_hint: Option<&PathBuf>) -> Result<PrivateSigner, SshError> {
+    if pem.contains("BEGIN OPENSSH PRIVATE KEY") {
+        return parse_openssh_private_key(pem, identity_hint);
+    }
+
     if let Ok(private_key) = rsa_private_key_from_pem_pkcs1(pem).or_else(|_| rsa_private_key_from_pem_pkcs8(pem)) {
         return Ok(PrivateSigner::Rsa(private_key));
     }
@@ -1403,6 +1592,173 @@ fn load_private_signer(pem: &str) -> Result<PrivateSigner, SshError> {
     }
 
     Err(SshError::Failed("unsupported private key type"))
+}
+
+fn parse_openssh_private_key(text: &str, identity_hint: Option<&PathBuf>) -> Result<PrivateSigner, SshError> {
+    let data = decode_pem_block(
+        text,
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "-----END OPENSSH PRIVATE KEY-----",
+    )
+    .ok_or(SshError::Failed("not an OpenSSH private key"))?;
+
+    let mut off = 0usize;
+    if data.len() < 15 || &data[..15] != b"openssh-key-v1\0" {
+        return Err(SshError::Failed("invalid OpenSSH key magic"));
+    }
+    off += 15;
+    let ciphername = read_ssh_string(&data, &mut off)?;
+    let kdfname = read_ssh_string(&data, &mut off)?;
+    let kdfoptions = read_ssh_string_owned(&data, &mut off)?;
+
+    let key_count = read_u32_at(&data, &mut off)? as usize;
+    if key_count == 0 {
+        return Err(SshError::Failed("OpenSSH private key has no keys"));
+    }
+    for _ in 0..key_count {
+        let _ = read_ssh_string(&data, &mut off)?;
+    }
+    let private_block_encrypted = read_ssh_string_owned(&data, &mut off)?;
+    let private_block = if ciphername == b"none" && kdfname == b"none" {
+        private_block_encrypted
+    } else if kdfname == b"bcrypt" {
+        decrypt_openssh_private_block(
+            ciphername,
+            &kdfoptions,
+            &private_block_encrypted,
+            identity_hint,
+        )?
+    } else {
+        return Err(SshError::Failed("unsupported OpenSSH key encryption settings"));
+    };
+    let mut poff = 0usize;
+    let check1 = read_u32_at(&private_block, &mut poff)?;
+    let check2 = read_u32_at(&private_block, &mut poff)?;
+    if check1 != check2 {
+        return Err(SshError::Failed("OpenSSH private key checkints mismatch"));
+    }
+    let key_type = read_ssh_string(&private_block, &mut poff)?;
+    if key_type == b"ssh-ed25519" {
+        let _public = read_ssh_string(&private_block, &mut poff)?;
+        let private = read_ssh_string(&private_block, &mut poff)?;
+        if private.len() < 32 {
+            return Err(SshError::Failed("invalid OpenSSH ed25519 private key"));
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&private[..32]);
+        return Ok(PrivateSigner::Ed25519(Ed25519PrivateKey::from_seed(&seed)));
+    }
+    if key_type == b"ssh-rsa" {
+        let n = read_ssh_mpint(&private_block, &mut poff)?;
+        let _e = read_ssh_mpint(&private_block, &mut poff)?;
+        let d = read_ssh_mpint(&private_block, &mut poff)?;
+        let _iqmp = read_ssh_mpint(&private_block, &mut poff)?;
+        let _p = read_ssh_mpint(&private_block, &mut poff)?;
+        let _q = read_ssh_mpint(&private_block, &mut poff)?;
+        let key = RsaPrivateKey::from_be_bytes(&n, &d)
+            .map_err(|_| SshError::Failed("invalid OpenSSH RSA private key"))?;
+        return Ok(PrivateSigner::Rsa(key));
+    }
+
+    Err(SshError::Failed("unsupported OpenSSH private key type"))
+}
+
+fn decode_pem_block(text: &str, begin_marker: &str, end_marker: &str) -> Option<Vec<u8>> {
+    let start = text.find(begin_marker)?;
+    let end = text.find(end_marker)?;
+    if end <= start {
+        return None;
+    }
+    let body = &text[start + begin_marker.len()..end];
+    let mut b64 = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.contains(':') {
+            continue;
+        }
+        b64.push_str(trimmed);
+    }
+    base64_decode(&b64)
+}
+
+#[derive(Clone, Copy)]
+enum OpensshAesMode {
+    Ctr,
+    Cbc,
+}
+
+fn openssh_cipher_params(ciphername: &[u8]) -> Option<(usize, usize, OpensshAesMode)> {
+    match ciphername {
+        b"aes128-ctr" => Some((16, 16, OpensshAesMode::Ctr)),
+        b"aes192-ctr" => Some((24, 16, OpensshAesMode::Ctr)),
+        b"aes256-ctr" => Some((32, 16, OpensshAesMode::Ctr)),
+        b"aes128-cbc" => Some((16, 16, OpensshAesMode::Cbc)),
+        b"aes192-cbc" => Some((24, 16, OpensshAesMode::Cbc)),
+        b"aes256-cbc" => Some((32, 16, OpensshAesMode::Cbc)),
+        _ => None,
+    }
+}
+
+fn parse_openssh_bcrypt_kdf_options(kdfoptions: &[u8]) -> Result<(Vec<u8>, u32), SshError> {
+    let mut off = 0usize;
+    let salt = read_ssh_string_owned(kdfoptions, &mut off)?;
+    let rounds = read_u32_at(kdfoptions, &mut off)?;
+    if off != kdfoptions.len() {
+        return Err(SshError::Failed("invalid OpenSSH bcrypt kdf options"));
+    }
+    if rounds == 0 {
+        return Err(SshError::Failed("invalid OpenSSH bcrypt rounds"));
+    }
+    Ok((salt, rounds))
+}
+
+fn prompt_key_passphrase(identity_hint: Option<&PathBuf>) -> Result<String, SshError> {
+    let prompt = if let Some(path) = identity_hint {
+        format!("Key passphrase ({}): ", path.display())
+    } else {
+        "Key passphrase: ".to_string()
+    };
+    rpassword::prompt_password(prompt).map_err(SshError::Io)
+}
+
+fn decrypt_openssh_private_block(
+    ciphername: &[u8],
+    kdfoptions: &[u8],
+    encrypted: &[u8],
+    identity_hint: Option<&PathBuf>,
+) -> Result<Vec<u8>, SshError> {
+    let (key_len, iv_len, mode) = openssh_cipher_params(ciphername)
+        .ok_or(SshError::Failed("unsupported OpenSSH ciphername"))?;
+    let (salt, rounds) = parse_openssh_bcrypt_kdf_options(kdfoptions)?;
+    let passphrase = prompt_key_passphrase(identity_hint)?;
+    if passphrase.is_empty() {
+        return Err(SshError::Failed("empty key passphrase"));
+    }
+
+    let key_iv = bcrypt_pbkdf_sha512(passphrase.as_bytes(), &salt, rounds, key_len + iv_len)
+        .map_err(|e| SshError::FailedOwned(format!("bcrypt_pbkdf failed: {e}")))?;
+    let key = &key_iv[..key_len];
+    let iv_src = &key_iv[key_len..key_len + iv_len];
+    let mut iv = [0u8; 16];
+    iv.copy_from_slice(iv_src);
+
+    let cipher = AesCipher::new(key).map_err(|e| SshError::FailedOwned(format!("invalid AES key: {e}")))?;
+    match mode {
+        OpensshAesMode::Ctr => Ok(aes_ctr_apply(&cipher, &iv, encrypted)),
+        OpensshAesMode::Cbc => aes_cbc_decrypt(&cipher, &iv, encrypted)
+            .map_err(|e| SshError::FailedOwned(format!("OpenSSH key decrypt failed: {e}"))),
+    }
+}
+
+fn read_ssh_mpint(payload: &[u8], offset: &mut usize) -> Result<Vec<u8>, SshError> {
+    let raw = read_ssh_string(payload, offset)?;
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    if raw[0] == 0 {
+        return Ok(raw[1..].to_vec());
+    }
+    Ok(raw.to_vec())
 }
 
 fn parse_ed25519_seed_from_pkcs8_private_key(private_key: &[u8]) -> Option<[u8; 32]> {
@@ -1428,16 +1784,23 @@ fn parse_ed25519_seed_from_pkcs8_private_key(private_key: &[u8]) -> Option<[u8; 
     None
 }
 
-fn validate_server_kexinit(payload: &[u8]) -> Result<(), SshError> {
+fn select_kex_algorithm(payload: &[u8]) -> Result<KexAlgorithm, SshError> {
     if payload.len() < 1 + NETNOX_SSH_KEXINIT_COOKIE_LEN || payload[0] != MSG_KEXINIT {
         return Err(SshError::Failed("invalid server kexinit"));
     }
     let mut off = 1 + NETNOX_SSH_KEXINIT_COOKIE_LEN;
     let kex_list = read_ssh_string(payload, &mut off)?;
-    if !namelist_contains(kex_list, NETNOX_SSH_REQUIRED_KEX_ALG.as_bytes()) {
-        return Err(SshError::Failed("required kex algorithm not offered"));
+    for candidate in NETNOX_SSH_KEX_ALG_LIST.split(',') {
+        if namelist_contains(kex_list, candidate.as_bytes()) {
+            return match candidate {
+                SSH_KEX_MLKEM768_HYBRID => Ok(KexAlgorithm::MlKem768X25519Sha256),
+                SSH_KEX_MLKEM768_NATIVE => Ok(KexAlgorithm::MlKem768Sha256),
+                NETNOX_SSH_REQUIRED_KEX_ALG => Ok(KexAlgorithm::Curve25519Sha256),
+                _ => Ok(KexAlgorithm::Curve25519Sha256),
+            };
+        }
     }
-    Ok(())
+    Err(SshError::Failed("no compatible kex algorithm offered"))
 }
 
 fn namelist_contains(list: &[u8], token: &[u8]) -> bool {
@@ -2447,22 +2810,12 @@ fn main() {
         client.server_ident().unwrap_or("<none>")
     );
 
-    let password = match opts.password {
-        Some(p) => p,
-        None => match prompt_password() {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("ERROR: Failed to read password from stdin.");
-                client.close();
-                std::process::exit(1);
-            }
-        },
-    };
-
-    if let Err(err) = client.set_password(&password) {
-        eprintln!("ERROR: Failed to configure password ({err})");
-        client.close();
-        std::process::exit(1);
+    if let Some(password) = opts.password.as_deref() {
+        if let Err(err) = client.set_password(password) {
+            eprintln!("ERROR: Failed to configure password ({err})");
+            client.close();
+            std::process::exit(1);
+        }
     }
 
     if let Err(err) = client.authenticate() {
@@ -2582,5 +2935,85 @@ mod tests {
             let dec = base64_decode(&enc).expect("decode");
             assert_eq!(dec, data, "mismatch at len={len}");
         }
+    }
+
+    #[test]
+    fn parse_openssh_ed25519_private_key() {
+        let seed = [0x11u8; 32];
+        let public = Ed25519PrivateKey::from_seed(&seed).verifying_key().to_bytes();
+
+        let mut pub_blob = Vec::new();
+        push_ssh_string(&mut pub_blob, b"ssh-ed25519");
+        push_ssh_string(&mut pub_blob, &public);
+
+        let mut private = Vec::new();
+        push_u32(&mut private, 0x01020304);
+        push_u32(&mut private, 0x01020304);
+        push_ssh_string(&mut private, b"ssh-ed25519");
+        push_ssh_string(&mut private, &public);
+        let mut priv64 = Vec::with_capacity(64);
+        priv64.extend_from_slice(&seed);
+        priv64.extend_from_slice(&public);
+        push_ssh_string(&mut private, &priv64);
+        push_ssh_string(&mut private, b"test-key");
+        private.push(1);
+
+        let mut key_bytes = Vec::new();
+        key_bytes.extend_from_slice(b"openssh-key-v1\0");
+        push_ssh_string(&mut key_bytes, b"none");
+        push_ssh_string(&mut key_bytes, b"none");
+        push_ssh_string(&mut key_bytes, b"");
+        push_u32(&mut key_bytes, 1);
+        push_ssh_string(&mut key_bytes, &pub_blob);
+        push_ssh_string(&mut key_bytes, &private);
+
+        let b64 = base64_encode(&key_bytes);
+        let pem = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+            b64
+        );
+
+        let signer = parse_openssh_private_key(&pem, None).expect("parse openssh private key");
+        match signer {
+            PrivateSigner::Ed25519(k) => {
+                let got = k.verifying_key().to_bytes();
+                assert_eq!(got, public);
+            }
+            _ => panic!("expected ed25519 signer"),
+        }
+    }
+
+    #[test]
+    fn openssh_cipher_params_maps_known_ciphers() {
+        assert!(openssh_cipher_params(b"aes256-ctr").is_some());
+        assert!(openssh_cipher_params(b"aes256-cbc").is_some());
+        assert!(openssh_cipher_params(b"chacha20-poly1305@openssh.com").is_none());
+    }
+
+    #[test]
+    fn parse_bcrypt_kdf_options_roundtrip() {
+        let mut opts = Vec::new();
+        push_ssh_string(&mut opts, b"salt-bytes");
+        push_u32(&mut opts, 16);
+        let (salt, rounds) = parse_openssh_bcrypt_kdf_options(&opts).expect("kdf opts");
+        assert_eq!(salt, b"salt-bytes");
+        assert_eq!(rounds, 16);
+    }
+
+    #[test]
+    fn select_kex_algorithm_prefers_hybrid_then_native_then_curve() {
+        let mut payload = vec![MSG_KEXINIT];
+        payload.extend_from_slice(&[0u8; NETNOX_SSH_KEXINIT_COOKIE_LEN]);
+        push_ssh_string(
+            &mut payload,
+            b"curve25519-sha256,mlkem768-sha256,mlkem768x25519-sha256",
+        );
+        for _ in 0..9 {
+            push_ssh_string(&mut payload, b"none");
+        }
+        payload.push(0);
+        push_u32(&mut payload, 0);
+        let selected = select_kex_algorithm(&payload).expect("select kex");
+        assert_eq!(selected, KexAlgorithm::MlKem768X25519Sha256);
     }
 }

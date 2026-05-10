@@ -13,6 +13,7 @@
 ## Features
 
 - **SSH-2** — Version exchange, `KEXINIT`, Curve25519 key exchange (`curve25519-sha256`), `NEWKEYS`, transport encryption (**AES-128-CTR**) and **HMAC-SHA256**
+- **PQC key exchange (experimental/custom)** — native ML-KEM (`mlkem768-sha256`) and hybrid ML-KEM+X25519 (`mlkem768x25519-sha256`) negotiation/handshake paths
 - **Password authentication** — `ssh-userauth` with the `password` method
 - **Session channel** — Open `session` channel, **remote exec** or **interactive shell**
 - **PTY** — Optional `pty-req` before shell (disable with `-T`, similar to OpenSSH)
@@ -66,7 +67,7 @@ noxssh [-h] [-V] [-d|-dd|-ddd] [-T] [-p port] [-w password] [-i identity_file] [
 | `-V`, `--version` | Print application and NoxTLS versions |
 | `-p port` | SSH port (default: 22) |
 | `-w password` | Password on the command line (avoid in production) |
-| `-i identity_file` | Identity file path (`.pub` probing + auth ordering hooks) |
+| `-i identity_file` | Identity file path for signed public-key auth (PEM RSA/Ed25519 PKCS#8 and OpenSSH keys, including bcrypt-encrypted AES keys; Ed25519 can derive public key when `.pub` is absent) |
 | `-L [bind_port:]host:hostport` | Local forwarding tunnel (direct-tcpip) |
 | `-R [bind_port:]host:hostport` | Remote forwarding tunnel (tcpip-forward / forwarded-tcpip) |
 | `-D port` | Dynamic SOCKS5 local forwarding |
