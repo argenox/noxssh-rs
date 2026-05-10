@@ -1,0 +1,68 @@
+name: Interop Smoke Tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  interop-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure submodule URL and init
+        run: |
+          git config -f .gitmodules submodule.noxtls.url https://github.com/argenox/noxtls-rust-private.git
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Install OpenSSH and Dropbear
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server dropbear-bin
+
+      - name: Create test user
+        run: |
+          sudo useradd -m -s /bin/bash noxuser || true
+          echo "noxuser:noxpass" | sudo chpasswd
+
+      - name: Configure and start OpenSSH
+        run: |
+          sudo mkdir -p /run/sshd
+          sudo cp /etc/ssh/sshd_config /tmp/sshd_config_ci
+          sudo bash -c "cat >> /tmp/sshd_config_ci <<'EOF'
+          Port 2222
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication yes
+          ChallengeResponseAuthentication yes
+          PermitRootLogin no
+          UsePAM no
+          EOF"
+          sudo /usr/sbin/sshd -f /tmp/sshd_config_ci
+
+      - name: Smoke test against OpenSSH
+        run: |
+          ./target/release/noxssh -w noxpass -p 2222 --strict-host-key-checking accept-new noxuser@127.0.0.1 "echo openssh-ok"
+
+      - name: Configure and start Dropbear
+        run: |
+          sudo /usr/sbin/dropbear -R -E -F -p 2223 &
+          sleep 2
+
+      - name: Smoke test against Dropbear
+        run: |
+          ./target/release/noxssh -w noxpass -p 2223 --strict-host-key-checking accept-new noxuser@127.0.0.1 "echo dropbear-ok"

@@ -1,12 +1,23 @@
 use noxtls_crypto::{
-    hmac_sha256, sha256, x25519_generate_private_key_auto, AesCipher, HmacDrbgSha256,
+    hmac_sha256, rsassa_sha256_sign, sha256, x25519_generate_private_key_auto, AesCipher,
+    Ed25519PrivateKey, HmacDrbgSha256,
     X25519PublicKey,
 };
+use noxtls_x509::{
+    parse_pkcs8_private_key_info_der, private_key_pem_to_der_pkcs8, rsa_private_key_from_pem_pkcs1,
+    rsa_private_key_from_pem_pkcs8,
+};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal;
+mod ssh;
+use ssh::config::{default_ssh_config_path, load_host_config};
+use ssh::known_hosts::{default_known_hosts_path, verify_or_add_host_key, HostKeyCheckingMode, KnownHostsPolicy};
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // App version comes from Cargo package metadata.
 const NOXSSH_VERSION_STRING: &str = env!("CARGO_PKG_VERSION");
@@ -43,6 +54,7 @@ const NETNOX_SSH_REQUIRED_KEX_ALG: &str = "curve25519-sha256";
 // SSH message numbers (RFC 4250+).
 const MSG_SERVICE_REQUEST: u8 = 5;
 const MSG_SERVICE_ACCEPT: u8 = 6;
+const MSG_IGNORE: u8 = 2;
 const MSG_KEXINIT: u8 = 20;
 const MSG_NEWKEYS: u8 = 21;
 const MSG_KEX_ECDH_INIT: u8 = 30;
@@ -50,6 +62,10 @@ const MSG_KEX_ECDH_REPLY: u8 = 31;
 const MSG_USERAUTH_REQUEST: u8 = 50;
 const MSG_USERAUTH_FAILURE: u8 = 51;
 const MSG_USERAUTH_SUCCESS: u8 = 52;
+const MSG_USERAUTH_PK_OK: u8 = 60;
+const MSG_GLOBAL_REQUEST: u8 = 80;
+const MSG_REQUEST_SUCCESS: u8 = 81;
+const MSG_REQUEST_FAILURE: u8 = 82;
 const MSG_CHANNEL_OPEN: u8 = 90;
 const MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
 const MSG_CHANNEL_OPEN_FAILURE: u8 = 92;
@@ -67,11 +83,19 @@ const SSH_AUTH_METHOD_PASSWORD: &str = "password";
 const SSH_CHANNEL_TYPE_SESSION: &str = "session";
 const SSH_CHANNEL_REQ_EXEC: &str = "exec";
 const SSH_CHANNEL_REQ_SHELL: &str = "shell";
+const SSH_CHANNEL_REQ_SUBSYSTEM: &str = "subsystem";
+
+const SFTP_MSG_INIT: u8 = 1;
+const SFTP_MSG_VERSION: u8 = 2;
+const SFTP_MSG_REALPATH: u8 = 16;
+const SFTP_MSG_NAME: u8 = 104;
+const SFTP_MSG_STATUS: u8 = 101;
 
 #[derive(Debug)]
 enum SshError {
     BadParam(&'static str),
     Failed(&'static str),
+    FailedOwned(String),
     AuthRejected,
     Io(io::Error),
 }
@@ -80,6 +104,7 @@ impl Display for SshError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadParam(msg) | Self::Failed(msg) => f.write_str(msg),
+            Self::FailedOwned(msg) => f.write_str(msg),
             Self::AuthRejected => f.write_str("authentication rejected"),
             Self::Io(err) => write!(f, "io error: {err}"),
         }
@@ -100,6 +125,8 @@ struct SshClient {
     username: String,
     host: String,
     password: String,
+    identity_files: Vec<PathBuf>,
+    preferred_auth_methods: Vec<String>,
     // High-level state flags for validating call ordering.
     connected: bool,
     kexinit_exchanged: bool,
@@ -108,6 +135,7 @@ struct SshClient {
     channel_open: bool,
     key_exchange_complete: bool,
     local_channel_id: u32,
+    next_local_channel_id: u32,
     remote_channel_id: u32,
     local_window_size: u32,
     remote_window_size: u32,
@@ -130,10 +158,24 @@ struct SshClient {
     s2c_counter: [u8; 16],
     c2s_cipher: Option<AesCipher>,
     s2c_cipher: Option<AesCipher>,
+    host_key_policy: KnownHostsPolicy,
+    connect_started_at: Instant,
+    last_keepalive_at: Instant,
+    keepalive_interval: Duration,
+    last_kex_at: Instant,
+    sent_packet_count: u64,
+    recv_packet_count: u64,
+    sent_payload_bytes: u64,
+    recv_payload_bytes: u64,
+    rekey_packet_threshold: u64,
+    rekey_byte_threshold: u64,
+    rekey_interval: Duration,
+    in_rekey: bool,
 }
 
 impl SshClient {
     fn new(stream: TcpStream, _port: u16) -> Self {
+        let now = Instant::now();
         Self {
             stream,
             client_ident: NETNOX_SSH_DEFAULT_CLIENT_IDENT.to_string(),
@@ -141,6 +183,8 @@ impl SshClient {
             username: String::new(),
             host: String::new(),
             password: String::new(),
+            identity_files: Vec::new(),
+            preferred_auth_methods: vec!["publickey".to_string(), "password".to_string()],
             connected: false,
             kexinit_exchanged: false,
             userauth_service_ready: false,
@@ -148,6 +192,7 @@ impl SshClient {
             channel_open: false,
             key_exchange_complete: false,
             local_channel_id: 0,
+            next_local_channel_id: 0,
             remote_channel_id: 0,
             local_window_size: 0,
             remote_window_size: 0,
@@ -169,6 +214,23 @@ impl SshClient {
             s2c_counter: [0; 16],
             c2s_cipher: None,
             s2c_cipher: None,
+            host_key_policy: KnownHostsPolicy {
+                mode: HostKeyCheckingMode::Strict,
+                path: default_known_hosts_path(),
+                batch_mode: false,
+            },
+            connect_started_at: now,
+            last_keepalive_at: now,
+            keepalive_interval: Duration::ZERO,
+            last_kex_at: now,
+            sent_packet_count: 0,
+            recv_packet_count: 0,
+            sent_payload_bytes: 0,
+            recv_payload_bytes: 0,
+            rekey_packet_threshold: 500_000,
+            rekey_byte_threshold: 512 * 1024 * 1024,
+            rekey_interval: Duration::from_secs(3600),
+            in_rekey: false,
         }
     }
 
@@ -192,6 +254,30 @@ impl SshClient {
         Ok(())
     }
 
+    fn set_host_key_policy(&mut self, mode: HostKeyCheckingMode, path: Option<PathBuf>, batch_mode: bool) {
+        self.host_key_policy.mode = mode;
+        if let Some(p) = path {
+            self.host_key_policy.path = p;
+        }
+        self.host_key_policy.batch_mode = batch_mode;
+    }
+
+    fn set_transport_timers(&mut self, keepalive_interval: Duration, rekey_interval: Duration) {
+        self.keepalive_interval = keepalive_interval;
+        self.rekey_interval = rekey_interval;
+    }
+
+    fn set_identity_files(&mut self, identity_files: Vec<PathBuf>) {
+        self.identity_files = identity_files;
+    }
+
+    fn set_preferred_auth_methods(&mut self, methods: Vec<String>) {
+        if methods.is_empty() {
+            return;
+        }
+        self.preferred_auth_methods = methods;
+    }
+
     fn connect(&mut self) -> Result<(), SshError> {
         // SSH starts with plaintext identification exchange.
         let tx_ident = format!("{}\r\n", self.client_ident);
@@ -205,6 +291,10 @@ impl SshClient {
             if line.starts_with("SSH-") {
                 self.server_ident = line;
                 self.connected = true;
+                let now = Instant::now();
+                self.connect_started_at = now;
+                self.last_keepalive_at = now;
+                self.last_kex_at = now;
                 return self.exchange_kexinit();
             }
         }
@@ -230,16 +320,21 @@ impl SshClient {
         if !self.userauth_service_ready {
             self.negotiate_userauth_service()?;
         }
-        self.send_userauth_password()?;
-        let payload = self.wait_for_message(MSG_USERAUTH_SUCCESS, Some(MSG_USERAUTH_FAILURE))?;
-        match payload.first().copied() {
-            Some(MSG_USERAUTH_SUCCESS) => {
+        let methods = self.preferred_auth_methods.clone();
+        for method in methods {
+            let ok = match method.as_str() {
+                "publickey" => self.try_publickey_auth()?,
+                "password" => self.try_password_auth()?,
+                "keyboard-interactive" => self.try_keyboard_interactive_auth()?,
+                _ => false,
+            };
+            if ok {
                 self.authenticated = true;
-                Ok(())
+                return Ok(());
             }
-            Some(MSG_USERAUTH_FAILURE) => Err(SshError::AuthRejected),
-            _ => Err(SshError::Failed("unexpected userauth response")),
         }
+
+        Err(SshError::AuthRejected)
     }
 
     fn open_session(&mut self) -> Result<(), SshError> {
@@ -250,8 +345,8 @@ impl SshClient {
         {
             return Err(SshError::BadParam("invalid state for open session"));
         }
-        // Current client uses a single session channel with local id 0.
-        self.local_channel_id = 0;
+        self.local_channel_id = self.next_local_channel_id;
+        self.next_local_channel_id = self.next_local_channel_id.wrapping_add(1);
         self.local_window_size = NETNOX_SSH_CHANNEL_WINDOW_SIZE;
         self.send_channel_open_session()?;
         let payload =
@@ -272,6 +367,64 @@ impl SshClient {
         let max_packet = read_u32_at(&payload, &mut off)?;
         if recipient_channel != self.local_channel_id {
             return Err(SshError::Failed("recipient channel mismatch"));
+        }
+        self.remote_channel_id = sender_channel;
+        self.remote_window_size = initial_window;
+        self.remote_max_packet_size = max_packet;
+        self.channel_open = true;
+        Ok(())
+    }
+
+    fn open_direct_tcpip(
+        &mut self,
+        destination_host: &str,
+        destination_port: u16,
+        originator_host: &str,
+        originator_port: u16,
+    ) -> Result<(), SshError> {
+        if !(self.connected
+            && self.kexinit_exchanged
+            && self.key_exchange_complete
+            && self.authenticated)
+        {
+            return Err(SshError::BadParam("invalid state for direct-tcpip"));
+        }
+
+        self.local_channel_id = self.next_local_channel_id;
+        self.next_local_channel_id = self.next_local_channel_id.wrapping_add(1);
+        self.local_window_size = NETNOX_SSH_CHANNEL_WINDOW_SIZE;
+
+        let mut payload = Vec::with_capacity(256);
+        payload.push(MSG_CHANNEL_OPEN);
+        push_ssh_string(&mut payload, b"direct-tcpip");
+        push_u32(&mut payload, self.local_channel_id);
+        push_u32(&mut payload, self.local_window_size);
+        push_u32(&mut payload, NETNOX_SSH_CHANNEL_MAX_PACKET_SIZE);
+        push_ssh_string(&mut payload, destination_host.as_bytes());
+        push_u32(&mut payload, destination_port as u32);
+        push_ssh_string(&mut payload, originator_host.as_bytes());
+        push_u32(&mut payload, originator_port as u32);
+        self.send_packet(&payload)?;
+
+        let response =
+            self.wait_for_message(MSG_CHANNEL_OPEN_CONFIRMATION, Some(MSG_CHANNEL_OPEN_FAILURE))?;
+        if response.is_empty() {
+            return Err(SshError::Failed("empty direct-tcpip response"));
+        }
+        if response[0] == MSG_CHANNEL_OPEN_FAILURE {
+            return Err(SshError::Failed("direct-tcpip open failed"));
+        }
+        if response[0] != MSG_CHANNEL_OPEN_CONFIRMATION {
+            return Err(SshError::Failed("unexpected direct-tcpip response"));
+        }
+
+        let mut off = 1usize;
+        let recipient_channel = read_u32_at(&response, &mut off)?;
+        let sender_channel = read_u32_at(&response, &mut off)?;
+        let initial_window = read_u32_at(&response, &mut off)?;
+        let max_packet = read_u32_at(&response, &mut off)?;
+        if recipient_channel != self.local_channel_id {
+            return Err(SshError::Failed("direct-tcpip recipient channel mismatch"));
         }
         self.remote_channel_id = sender_channel;
         self.remote_window_size = initial_window;
@@ -337,6 +490,41 @@ impl SshClient {
         let rsp = self.wait_for_message(MSG_CHANNEL_SUCCESS, Some(MSG_CHANNEL_FAILURE))?;
         if rsp.first().copied() != Some(MSG_CHANNEL_SUCCESS) {
             return Err(SshError::Failed("shell request rejected"));
+        }
+        Ok(())
+    }
+
+    fn send_window_change(&mut self, cols: u32, rows: u32) -> Result<(), SshError> {
+        if !self.channel_open {
+            return Err(SshError::BadParam("channel not open"));
+        }
+        let mut payload = Vec::with_capacity(128);
+        payload.push(MSG_CHANNEL_REQUEST);
+        push_u32(&mut payload, self.remote_channel_id);
+        push_ssh_string(&mut payload, b"window-change");
+        payload.push(0); // no reply requested
+        push_u32(&mut payload, cols);
+        push_u32(&mut payload, rows);
+        push_u32(&mut payload, 0);
+        push_u32(&mut payload, 0);
+        self.send_packet(&payload)
+    }
+
+    fn request_subsystem(&mut self, subsystem: &str) -> Result<(), SshError> {
+        if !(self.connected && self.kexinit_exchanged && self.key_exchange_complete && self.channel_open)
+        {
+            return Err(SshError::BadParam("invalid state for subsystem"));
+        }
+        let mut payload = Vec::with_capacity(256);
+        payload.push(MSG_CHANNEL_REQUEST);
+        push_u32(&mut payload, self.remote_channel_id);
+        push_ssh_string(&mut payload, SSH_CHANNEL_REQ_SUBSYSTEM.as_bytes());
+        payload.push(1);
+        push_ssh_string(&mut payload, subsystem.as_bytes());
+        self.send_packet(&payload)?;
+        let rsp = self.wait_for_message(MSG_CHANNEL_SUCCESS, Some(MSG_CHANNEL_FAILURE))?;
+        if rsp.first().copied() != Some(MSG_CHANNEL_SUCCESS) {
+            return Err(SshError::Failed("subsystem request rejected"));
         }
         Ok(())
     }
@@ -428,6 +616,80 @@ impl SshClient {
         }
     }
 
+    fn recv_packet_with_timeout(&mut self, timeout_ms: u64) -> Result<Option<Vec<u8>>, SshError> {
+        let old = self.stream.read_timeout()?;
+        self.stream
+            .set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
+        let recv = self.recv_packet();
+        self.stream.set_read_timeout(old)?;
+        match recv {
+            Ok(v) => Ok(Some(v)),
+            Err(SshError::Io(err))
+                if err.kind() == io::ErrorKind::TimedOut
+                    || err.kind() == io::ErrorKind::WouldBlock =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn maybe_send_keepalive(&mut self) -> Result<(), SshError> {
+        if self.keepalive_interval.is_zero() {
+            return Ok(());
+        }
+        if self.last_keepalive_at.elapsed() < self.keepalive_interval {
+            return Ok(());
+        }
+        let mut payload = Vec::with_capacity(5);
+        payload.push(MSG_IGNORE);
+        push_ssh_string(&mut payload, &[]);
+        self.send_packet(&payload)?;
+        self.last_keepalive_at = Instant::now();
+        Ok(())
+    }
+
+    fn maybe_rekey(&mut self) -> Result<(), SshError> {
+        if !self.key_exchange_complete || self.in_rekey {
+            return Ok(());
+        }
+        let packet_triggered = self.sent_packet_count >= self.rekey_packet_threshold
+            || self.recv_packet_count >= self.rekey_packet_threshold;
+        let bytes_triggered = self.sent_payload_bytes >= self.rekey_byte_threshold
+            || self.recv_payload_bytes >= self.rekey_byte_threshold;
+        let time_triggered = self.last_kex_at.elapsed() >= self.rekey_interval;
+
+        if !(packet_triggered || bytes_triggered || time_triggered) {
+            return Ok(());
+        }
+
+        self.in_rekey = true;
+        let rekey_result = self.exchange_kexinit();
+        self.in_rekey = false;
+        rekey_result?;
+        self.sent_packet_count = 0;
+        self.recv_packet_count = 0;
+        self.sent_payload_bytes = 0;
+        self.recv_payload_bytes = 0;
+        self.last_kex_at = Instant::now();
+        Ok(())
+    }
+
+    fn request_remote_tcpip_forward(&mut self, bind_host: &str, bind_port: u16) -> Result<(), SshError> {
+        let mut payload = Vec::with_capacity(128);
+        payload.push(MSG_GLOBAL_REQUEST);
+        push_ssh_string(&mut payload, b"tcpip-forward");
+        payload.push(1);
+        push_ssh_string(&mut payload, bind_host.as_bytes());
+        push_u32(&mut payload, bind_port as u32);
+        self.send_packet(&payload)?;
+        let rsp = self.wait_for_message(MSG_REQUEST_SUCCESS, Some(MSG_REQUEST_FAILURE))?;
+        if rsp.first().copied() != Some(MSG_REQUEST_SUCCESS) {
+            return Err(SshError::Failed("remote forward request rejected"));
+        }
+        Ok(())
+    }
+
     fn close(&mut self) {
         self.connected = false;
         self.kexinit_exchanged = false;
@@ -436,6 +698,7 @@ impl SshClient {
         self.authenticated = false;
         self.channel_open = false;
         self.local_channel_id = 0;
+        self.next_local_channel_id = 0;
         self.remote_channel_id = 0;
         self.local_window_size = 0;
         self.remote_window_size = 0;
@@ -488,6 +751,16 @@ impl SshClient {
         if signature.is_empty() || server_pub.len() != 32 {
             return Err(SshError::Failed("invalid kex ecdh reply fields"));
         }
+        let host_key_type =
+            ssh_host_key_type_from_blob(&host_key_blob).ok_or(SshError::Failed("invalid host key blob"))?;
+        let host_key_b64 = base64_encode(&host_key_blob);
+        verify_or_add_host_key(
+            &self.host,
+            &host_key_type,
+            &host_key_b64,
+            &self.host_key_policy,
+        )
+        .map_err(SshError::FailedOwned)?;
         let mut server_pub_arr = [0u8; 32];
         server_pub_arr.copy_from_slice(&server_pub);
         // Derive shared secret K = X25519(client_priv, server_pub).
@@ -605,6 +878,69 @@ impl SshClient {
         self.send_packet(&payload)
     }
 
+    fn try_password_auth(&mut self) -> Result<bool, SshError> {
+        self.send_userauth_password()?;
+        let payload = self.wait_for_message(MSG_USERAUTH_SUCCESS, Some(MSG_USERAUTH_FAILURE))?;
+        match payload.first().copied() {
+            Some(MSG_USERAUTH_SUCCESS) => Ok(true),
+            Some(MSG_USERAUTH_FAILURE) => Ok(false),
+            _ => Err(SshError::Failed("unexpected userauth response")),
+        }
+    }
+
+    fn try_publickey_auth(&mut self) -> Result<bool, SshError> {
+        // OpenSSH-compatible identity loading is plumbed here; full key-sign auth support
+        // is staged for a follow-up implementation. We probe accepted methods and then
+        // continue fallback order if signature-capable key handling is unavailable.
+        if try_agent_publickey_auth(self)? {
+            return Ok(true);
+        }
+        let identity_files = self.identity_files.clone();
+        for identity in identity_files {
+            if let Some((algorithm, public_key_b64)) = read_public_key_line(&identity) {
+                let pub_blob = base64_decode(&public_key_b64)
+                    .ok_or(SshError::Failed("invalid base64 in identity public key"))?;
+                if !matches!(
+                    algorithm.as_str(),
+                    "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" | "ssh-ed25519"
+                ) {
+                    continue;
+                }
+                if !send_publickey_probe(self, &algorithm, &pub_blob)? {
+                    continue;
+                }
+                if let Some(sig) = sign_publickey_auth_request(self, &identity, &algorithm, &pub_blob)?
+                {
+                    send_signed_publickey_request(self, &algorithm, &pub_blob, &sig)?;
+                    let rsp = self.wait_for_message(MSG_USERAUTH_SUCCESS, Some(MSG_USERAUTH_FAILURE))?;
+                    match rsp.first().copied() {
+                        Some(MSG_USERAUTH_SUCCESS) => return Ok(true),
+                        Some(MSG_USERAUTH_FAILURE) => continue,
+                        _ => return Err(SshError::Failed("unexpected signed publickey response")),
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn try_keyboard_interactive_auth(&mut self) -> Result<bool, SshError> {
+        let mut payload = Vec::with_capacity(256);
+        payload.push(MSG_USERAUTH_REQUEST);
+        push_ssh_string(&mut payload, self.username.as_bytes());
+        push_ssh_string(&mut payload, SSH_SERVICE_CONNECTION.as_bytes());
+        push_ssh_string(&mut payload, b"keyboard-interactive");
+        push_ssh_string(&mut payload, b"");
+        push_ssh_string(&mut payload, b"");
+        self.send_packet(&payload)?;
+        let rsp = self.wait_for_message(MSG_USERAUTH_SUCCESS, Some(MSG_USERAUTH_FAILURE))?;
+        match rsp.first().copied() {
+            Some(MSG_USERAUTH_SUCCESS) => Ok(true),
+            Some(MSG_USERAUTH_FAILURE) => Ok(false),
+            _ => Ok(false),
+        }
+    }
+
     fn send_channel_open_session(&mut self) -> Result<(), SshError> {
         let mut payload = Vec::with_capacity(128);
         payload.push(MSG_CHANNEL_OPEN);
@@ -632,6 +968,7 @@ impl SshClient {
         if payload.is_empty() {
             return Err(SshError::BadParam("empty payload"));
         }
+        self.maybe_rekey()?;
         // Prior to NEWKEYS, SSH packet framing uses minimum block size 8.
         let block_size = if self.key_exchange_complete {
             NETNOX_SSH_AES_BLOCK_LEN
@@ -673,12 +1010,20 @@ impl SshClient {
             self.stream.write_all(&mac)?;
             self.stream.flush()?;
             self.send_seq = self.send_seq.wrapping_add(1);
+            self.sent_packet_count = self.sent_packet_count.saturating_add(1);
+            self.sent_payload_bytes = self
+                .sent_payload_bytes
+                .saturating_add(payload.len() as u64);
             return Ok(());
         }
 
         self.stream.write_all(&plain)?;
         self.stream.flush()?;
         self.send_seq = self.send_seq.wrapping_add(1);
+        self.sent_packet_count = self.sent_packet_count.saturating_add(1);
+        self.sent_payload_bytes = self
+            .sent_payload_bytes
+            .saturating_add(payload.len() as u64);
         Ok(())
     }
 
@@ -737,6 +1082,10 @@ impl SshClient {
             let payload_len = packet_len - 1 - padding_len;
             let start = 5;
             let end = start + payload_len;
+            self.recv_packet_count = self.recv_packet_count.saturating_add(1);
+            self.recv_payload_bytes = self
+                .recv_payload_bytes
+                .saturating_add(payload_len as u64);
             return Ok(plain[start..end].to_vec());
         }
 
@@ -754,6 +1103,10 @@ impl SshClient {
         }
         let payload_len = packet_len - 1 - padding_len;
         self.recv_seq = self.recv_seq.wrapping_add(1);
+        self.recv_packet_count = self.recv_packet_count.saturating_add(1);
+        self.recv_payload_bytes = self
+            .recv_payload_bytes
+            .saturating_add(payload_len as u64);
         Ok(packet[1..1 + payload_len].to_vec())
     }
 
@@ -833,6 +1186,246 @@ fn compute_exchange_hash(
         return Err(SshError::Failed("exchange hash input too large"));
     }
     Ok(sha256(&input))
+}
+
+fn ssh_host_key_type_from_blob(blob: &[u8]) -> Option<String> {
+    let mut off = 0usize;
+    let key_type = read_ssh_string(blob, &mut off).ok()?;
+    Some(String::from_utf8_lossy(key_type).to_string())
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < input.len() {
+        let b0 = input[i];
+        let b1 = if i + 1 < input.len() { input[i + 1] } else { 0 };
+        let b2 = if i + 2 < input.len() { input[i + 2] } else { 0 };
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        if i + 1 < input.len() {
+            out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if i + 2 < input.len() {
+            out.push(TABLE[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut quartet = [0u8; 4];
+    let mut qlen = 0usize;
+    for ch in input.bytes().filter(|b| !b" \r\n\t".contains(b)) {
+        let val = match ch {
+            b'A'..=b'Z' => ch - b'A',
+            b'a'..=b'z' => ch - b'a' + 26,
+            b'0'..=b'9' => ch - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => 64,
+            _ => return None,
+        };
+        quartet[qlen] = val;
+        qlen += 1;
+        if qlen == 4 {
+            if quartet[0] == 64 || quartet[1] == 64 {
+                return None;
+            }
+            let n = ((quartet[0] as u32) << 18)
+                | ((quartet[1] as u32) << 12)
+                | (((quartet[2] & 0x3f) as u32) << 6)
+                | ((quartet[3] & 0x3f) as u32);
+            out.push(((n >> 16) & 0xff) as u8);
+            if quartet[2] != 64 {
+                out.push(((n >> 8) & 0xff) as u8);
+            }
+            if quartet[3] != 64 {
+                out.push((n & 0xff) as u8);
+            }
+            qlen = 0;
+        }
+    }
+    if qlen != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+fn read_public_key_line(identity_path: &PathBuf) -> Option<(String, String)> {
+    let pub_path = if identity_path
+        .extension()
+        .map(|ext| ext == "pub")
+        .unwrap_or(false)
+    {
+        identity_path.clone()
+    } else {
+        PathBuf::from(format!("{}.pub", identity_path.display()))
+    };
+    let content = std::fs::read_to_string(pub_path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut fields = trimmed.split_whitespace();
+        let key_type = fields.next()?.to_string();
+        let key_data = fields.next()?.to_string();
+        return Some((key_type, key_data));
+    }
+    None
+}
+
+fn send_publickey_probe(client: &mut SshClient, algorithm: &str, pub_blob: &[u8]) -> Result<bool, SshError> {
+    let mut payload = Vec::with_capacity(1024);
+    payload.push(MSG_USERAUTH_REQUEST);
+    push_ssh_string(&mut payload, client.username.as_bytes());
+    push_ssh_string(&mut payload, SSH_SERVICE_CONNECTION.as_bytes());
+    push_ssh_string(&mut payload, b"publickey");
+    payload.push(0);
+    push_ssh_string(&mut payload, algorithm.as_bytes());
+    push_ssh_string(&mut payload, pub_blob);
+    client.send_packet(&payload)?;
+
+    for _ in 0..32 {
+        let rsp = client.recv_packet()?;
+        if rsp.is_empty() {
+            continue;
+        }
+        match rsp[0] {
+            MSG_USERAUTH_PK_OK => return Ok(true),
+            MSG_USERAUTH_FAILURE => return Ok(false),
+            MSG_USERAUTH_SUCCESS => return Ok(true),
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+fn sign_publickey_auth_request(
+    client: &SshClient,
+    identity_path: &PathBuf,
+    algorithm: &str,
+    pub_blob: &[u8],
+) -> Result<Option<Vec<u8>>, SshError> {
+    let pem = std::fs::read_to_string(identity_path).map_err(SshError::Io)?;
+    let mut signed_data = Vec::new();
+    push_ssh_string(&mut signed_data, &client.session_id[..client.session_id_len]);
+    signed_data.push(MSG_USERAUTH_REQUEST);
+    push_ssh_string(&mut signed_data, client.username.as_bytes());
+    push_ssh_string(&mut signed_data, SSH_SERVICE_CONNECTION.as_bytes());
+    push_ssh_string(&mut signed_data, b"publickey");
+    signed_data.push(1);
+    push_ssh_string(&mut signed_data, algorithm.as_bytes());
+    push_ssh_string(&mut signed_data, pub_blob);
+
+    match load_private_signer(&pem)? {
+        PrivateSigner::Rsa(private_key) => {
+            let raw_sig = rsassa_sha256_sign(&private_key, &signed_data)
+                .map_err(|_| SshError::Failed("rsa-sha256 signing failed"))?;
+            let mut sig_blob = Vec::new();
+            let sig_alg = if algorithm == "ssh-rsa" {
+                "rsa-sha2-256"
+            } else {
+                algorithm
+            };
+            push_ssh_string(&mut sig_blob, sig_alg.as_bytes());
+            push_ssh_string(&mut sig_blob, &raw_sig);
+            Ok(Some(sig_blob))
+        }
+        PrivateSigner::Ed25519(private_key) => {
+            if algorithm != "ssh-ed25519" {
+                return Ok(None);
+            }
+            let raw_sig = private_key.sign(&signed_data);
+            let mut sig_blob = Vec::new();
+            push_ssh_string(&mut sig_blob, b"ssh-ed25519");
+            push_ssh_string(&mut sig_blob, &raw_sig);
+            Ok(Some(sig_blob))
+        }
+    }
+}
+
+fn send_signed_publickey_request(
+    client: &mut SshClient,
+    algorithm: &str,
+    pub_blob: &[u8],
+    signature_blob: &[u8],
+) -> Result<(), SshError> {
+    let mut payload = Vec::with_capacity(2048);
+    payload.push(MSG_USERAUTH_REQUEST);
+    push_ssh_string(&mut payload, client.username.as_bytes());
+    push_ssh_string(&mut payload, SSH_SERVICE_CONNECTION.as_bytes());
+    push_ssh_string(&mut payload, b"publickey");
+    payload.push(1);
+    push_ssh_string(&mut payload, algorithm.as_bytes());
+    push_ssh_string(&mut payload, pub_blob);
+    push_ssh_string(&mut payload, signature_blob);
+    client.send_packet(&payload)
+}
+
+fn try_agent_publickey_auth(_client: &mut SshClient) -> Result<bool, SshError> {
+    // Agent integration abstraction hook: we detect agent presence and leave a single
+    // extension point for future SSH-agent protocol support.
+    if std::env::var("SSH_AUTH_SOCK").is_ok() {
+        ssh_debug(1, format_args!("SSH_AUTH_SOCK detected; agent auth hook not yet implemented"));
+    }
+    Ok(false)
+}
+
+enum PrivateSigner {
+    Rsa(noxtls_crypto::RsaPrivateKey),
+    Ed25519(Ed25519PrivateKey),
+}
+
+fn load_private_signer(pem: &str) -> Result<PrivateSigner, SshError> {
+    if let Ok(private_key) = rsa_private_key_from_pem_pkcs1(pem).or_else(|_| rsa_private_key_from_pem_pkcs8(pem)) {
+        return Ok(PrivateSigner::Rsa(private_key));
+    }
+
+    let der = private_key_pem_to_der_pkcs8(pem)
+        .map_err(|_| SshError::Failed("failed to parse private key from identity file"))?;
+    let info = parse_pkcs8_private_key_info_der(&der)
+        .map_err(|_| SshError::Failed("invalid pkcs8 private key"))?;
+    // id-Ed25519 OID (1.3.101.112)
+    if info.algorithm_oid.as_slice() == [0x2b, 0x65, 0x70] {
+        let seed = parse_ed25519_seed_from_pkcs8_private_key(&info.private_key)
+            .ok_or(SshError::Failed("invalid ed25519 private key payload"))?;
+        return Ok(PrivateSigner::Ed25519(Ed25519PrivateKey::from_seed(&seed)));
+    }
+
+    Err(SshError::Failed("unsupported private key type"))
+}
+
+fn parse_ed25519_seed_from_pkcs8_private_key(private_key: &[u8]) -> Option<[u8; 32]> {
+    // RFC 8410 PKCS#8 wraps Ed25519 seed in an OCTET STRING, often nested.
+    if private_key.len() == 32 {
+        return private_key.try_into().ok();
+    }
+    if private_key.len() >= 2 && private_key[0] == 0x04 {
+        let len = private_key[1] as usize;
+        if private_key.len() == len + 2 {
+            let inner = &private_key[2..];
+            if inner.len() == 32 {
+                return inner.try_into().ok();
+            }
+            if inner.len() >= 2 && inner[0] == 0x04 {
+                let inner_len = inner[1] as usize;
+                if inner.len() == inner_len + 2 && inner_len == 32 {
+                    return inner[2..].try_into().ok();
+                }
+            }
+        }
+    }
+    None
 }
 
 fn validate_server_kexinit(payload: &[u8]) -> Result<(), SshError> {
@@ -983,15 +1576,36 @@ struct CliOptions {
     target: String,
     command: Option<String>,
     password: Option<String>,
+    identity_files: Vec<PathBuf>,
+    preferred_auth_methods: Vec<String>,
     request_pty: bool,
     debug_level: u8,
+    host_key_mode: HostKeyCheckingMode,
+    known_hosts_path: Option<PathBuf>,
+    batch_mode: bool,
+    connect_timeout_ms: u64,
+    read_timeout_ms: u64,
+    keepalive_interval_ms: u64,
+    rekey_interval_s: u64,
+    use_ssh_config: bool,
+    local_forward: Option<LocalForwardSpec>,
+    remote_forward: Option<LocalForwardSpec>,
+    dynamic_forward_port: Option<u16>,
+    sftp_ls: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalForwardSpec {
+    listen_port: u16,
+    destination_host: String,
+    destination_port: u16,
 }
 
 fn print_usage(program: &str) {
     println!("{program} {NOXSSH_VERSION_STRING}");
     println!("Using NoxTLS Library {NOXTLS_VERSION_STRING}");
     println!(
-        "Usage: {program} [-h] [-V] [-d|-dd|-ddd] [-T] [-p port] [-w password] [user@]host [command]"
+        "Usage: {program} [-h] [-V] [-d|-dd|-ddd] [-T] [-p port] [-w password] [-i identity_file] [-L [bind_port:]host:hostport] [-R [bind_port:]host:hostport] [-D port] [--sftp-ls path] [-o key=value] [--strict-host-key-checking mode] [--known-hosts path] [--connect-timeout-ms ms] [--read-timeout-ms ms] [--server-alive-interval sec] [--batch-mode] [user@]host [command]"
     );
     println!("Options:");
     println!("  -h, --help     Show this help and exit.");
@@ -1002,6 +1616,28 @@ fn print_usage(program: &str) {
     println!("  -T             Disable PTY allocation for shell sessions.");
     println!("  -p port        SSH server port (default: 22).");
     println!("  -w password    Password (avoid command line in production).");
+    println!("  -L [bind_port:]host:hostport");
+    println!("                 Local TCP forwarding (SSH direct-tcpip).");
+    println!("  -R [bind_port:]host:hostport");
+    println!("                 Remote TCP forwarding (tcpip-forward).");
+    println!("  -D <port>      Dynamic SOCKS5 forwarding on local port.");
+    println!("  --sftp-ls <path>");
+    println!("                 Start SFTP subsystem and list canonical path entries.");
+    println!("  -i identity_file");
+    println!("                 Identity file path (public key probing and future key auth).");
+    println!("  -o key=value   OpenSSH-style options (limited support).");
+    println!("  -F none        Disable loading ~/.ssh/config.");
+    println!("  --strict-host-key-checking <strict|accept-new|off>");
+    println!("                 Host key verification policy (default: strict).");
+    println!("  --known-hosts <path>");
+    println!("                 Path to known_hosts file.");
+    println!("  --connect-timeout-ms <ms>");
+    println!("                 TCP connect timeout in milliseconds (default: 10000).");
+    println!("  --read-timeout-ms <ms>");
+    println!("                 Socket read timeout in milliseconds (default: 30000).");
+    println!("  --server-alive-interval <sec>");
+    println!("                 Send SSH keepalive ignore packets every N seconds.");
+    println!("  --batch-mode   Disable interactive prompts (including TOFU host key trust).");
 }
 
 fn parse_target(target: &str) -> Result<(String, String), SshError> {
@@ -1021,6 +1657,46 @@ fn parse_target(target: &str) -> Result<(String, String), SshError> {
     }
 }
 
+fn parse_openssh_option(option: &str, opts: &mut CliOptions) -> Result<(), SshError> {
+    let (key, value) = option
+        .split_once('=')
+        .ok_or(SshError::BadParam("expected -o key=value"))?;
+    match key {
+        "StrictHostKeyChecking" => {
+            opts.host_key_mode = HostKeyCheckingMode::parse(&value.to_ascii_lowercase())
+                .ok_or(SshError::BadParam("invalid StrictHostKeyChecking value"))?;
+        }
+        "UserKnownHostsFile" => {
+            opts.known_hosts_path = Some(PathBuf::from(value));
+        }
+        "ConnectTimeout" => {
+            let secs = value
+                .parse::<u64>()
+                .map_err(|_| SshError::BadParam("invalid ConnectTimeout"))?;
+            opts.connect_timeout_ms = secs.saturating_mul(1000);
+        }
+        "ServerAliveInterval" => {
+            let secs = value
+                .parse::<u64>()
+                .map_err(|_| SshError::BadParam("invalid ServerAliveInterval"))?;
+            opts.keepalive_interval_ms = secs.saturating_mul(1000);
+        }
+        "BatchMode" => {
+            opts.batch_mode = value.eq_ignore_ascii_case("yes") || value == "1";
+        }
+        "PreferredAuthentications" => {
+            opts.preferred_auth_methods = value
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+        }
+        _ => return Err(SshError::BadParam("unsupported -o option")),
+    }
+    Ok(())
+}
+
 fn parse_args(args: &[String]) -> Result<CliOptions, SshError> {
     if args.len() < 2 {
         return Err(SshError::BadParam("missing arguments"));
@@ -1028,6 +1704,12 @@ fn parse_args(args: &[String]) -> Result<CliOptions, SshError> {
     let mut opts = CliOptions {
         port: NETNOX_SSH_DEFAULT_PORT,
         request_pty: true,
+        host_key_mode: HostKeyCheckingMode::Strict,
+        connect_timeout_ms: 10_000,
+        read_timeout_ms: 30_000,
+        rekey_interval_s: 3_600,
+        preferred_auth_methods: vec!["publickey".to_string(), "password".to_string()],
+        use_ssh_config: true,
         ..Default::default()
     };
     let mut i = 1usize;
@@ -1069,6 +1751,110 @@ fn parse_args(args: &[String]) -> Result<CliOptions, SshError> {
                 opts.password = Some(args[i + 1].clone());
                 i += 2;
             }
+            "-i" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing -i value"));
+                }
+                opts.identity_files.push(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "-L" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing -L value"));
+                }
+                opts.local_forward = Some(parse_local_forward_spec(&args[i + 1])?);
+                i += 2;
+            }
+            "-R" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing -R value"));
+                }
+                opts.remote_forward = Some(parse_local_forward_spec(&args[i + 1])?);
+                i += 2;
+            }
+            "-D" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing -D value"));
+                }
+                opts.dynamic_forward_port = Some(
+                    args[i + 1]
+                        .parse::<u16>()
+                        .map_err(|_| SshError::BadParam("invalid -D port"))?,
+                );
+                i += 2;
+            }
+            "--strict-host-key-checking" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing host key checking mode"));
+                }
+                opts.host_key_mode = HostKeyCheckingMode::parse(&args[i + 1])
+                    .ok_or(SshError::BadParam("invalid host key checking mode"))?;
+                i += 2;
+            }
+            "--known-hosts" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing known-hosts path"));
+                }
+                opts.known_hosts_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--connect-timeout-ms" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing connect timeout"));
+                }
+                opts.connect_timeout_ms = args[i + 1]
+                    .parse::<u64>()
+                    .map_err(|_| SshError::BadParam("invalid connect timeout"))?;
+                i += 2;
+            }
+            "--read-timeout-ms" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing read timeout"));
+                }
+                opts.read_timeout_ms = args[i + 1]
+                    .parse::<u64>()
+                    .map_err(|_| SshError::BadParam("invalid read timeout"))?;
+                i += 2;
+            }
+            "--server-alive-interval" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing server alive interval"));
+                }
+                let secs = args[i + 1]
+                    .parse::<u64>()
+                    .map_err(|_| SshError::BadParam("invalid server alive interval"))?;
+                opts.keepalive_interval_ms = secs.saturating_mul(1000);
+                i += 2;
+            }
+            "--batch-mode" => {
+                opts.batch_mode = true;
+                i += 1;
+            }
+            "--sftp-ls" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing --sftp-ls path"));
+                }
+                opts.sftp_ls = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "-o" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing -o option"));
+                }
+                parse_openssh_option(&args[i + 1], &mut opts)?;
+                i += 2;
+            }
+            "-F" => {
+                if i + 1 >= args.len() {
+                    return Err(SshError::BadParam("missing -F value"));
+                }
+                if args[i + 1].eq_ignore_ascii_case("none") {
+                    opts.use_ssh_config = false;
+                } else {
+                    return Err(SshError::BadParam("only -F none is currently supported"));
+                }
+                i += 2;
+            }
             x if x.starts_with('-') => return Err(SshError::BadParam("unknown option")),
             _ => {
                 if opts.target.is_empty() {
@@ -1098,18 +1884,104 @@ fn parse_args(args: &[String]) -> Result<CliOptions, SshError> {
     Ok(opts)
 }
 
-fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, SshError> {
+fn apply_ssh_host_config(opts: &mut CliOptions, username: &mut String, host: &str) {
+    if !opts.use_ssh_config {
+        return;
+    }
+    let cfg_path = default_ssh_config_path();
+    let Some(host_cfg) = load_host_config(&cfg_path, host) else {
+        return;
+    };
+
+    if *username == NOXSSH_DEFAULT_USER {
+        if let Some(user) = host_cfg.user {
+            *username = user;
+        }
+    }
+    if opts.port == NETNOX_SSH_DEFAULT_PORT {
+        if let Some(port) = host_cfg.port {
+            opts.port = port;
+        }
+    }
+    if opts.identity_files.is_empty() && !host_cfg.identity_files.is_empty() {
+        opts.identity_files = host_cfg.identity_files;
+    }
+    if opts.host_key_mode == HostKeyCheckingMode::Strict {
+        if let Some(mode) = host_cfg.strict_host_key_checking {
+            opts.host_key_mode = mode;
+        }
+    }
+    if opts.known_hosts_path.is_none() {
+        opts.known_hosts_path = host_cfg.user_known_hosts_file;
+    }
+    if opts.keepalive_interval_ms == 0 {
+        if let Some(sec) = host_cfg.server_alive_interval {
+            opts.keepalive_interval_ms = sec.saturating_mul(1000);
+        }
+    }
+    if !opts.batch_mode {
+        if let Some(batch) = host_cfg.batch_mode {
+            opts.batch_mode = batch;
+        }
+    }
+    if opts.preferred_auth_methods == ["publickey".to_string(), "password".to_string()] {
+        if !host_cfg.preferred_authentications.is_empty() {
+            opts.preferred_auth_methods = host_cfg.preferred_authentications;
+        }
+    }
+}
+
+fn parse_local_forward_spec(spec: &str) -> Result<LocalForwardSpec, SshError> {
+    let mut parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() == 2 {
+        // host:port with implicit local bind port == destination port.
+        let destination_host = parts.remove(0).to_string();
+        let destination_port = parts
+            .remove(0)
+            .parse::<u16>()
+            .map_err(|_| SshError::BadParam("invalid -L destination port"))?;
+        return Ok(LocalForwardSpec {
+            listen_port: destination_port,
+            destination_host,
+            destination_port,
+        });
+    }
+    if parts.len() != 3 {
+        return Err(SshError::BadParam(
+            "invalid -L format, expected [bind_port:]host:hostport",
+        ));
+    }
+    let listen_port = parts[0]
+        .parse::<u16>()
+        .map_err(|_| SshError::BadParam("invalid -L bind port"))?;
+    let destination_host = parts[1].to_string();
+    let destination_port = parts[2]
+        .parse::<u16>()
+        .map_err(|_| SshError::BadParam("invalid -L destination port"))?;
+    Ok(LocalForwardSpec {
+        listen_port,
+        destination_host,
+        destination_port,
+    })
+}
+
+fn connect_tcp(host: &str, port: u16, connect_timeout: Duration, read_timeout: Duration) -> Result<TcpStream, SshError> {
     let mut last_err: Option<io::Error> = None;
     for addr in (host, port)
         .to_socket_addrs()
         .map_err(SshError::Io)?
         .collect::<Vec<_>>()
     {
-        match TcpStream::connect(addr) {
+        match TcpStream::connect_timeout(&addr, connect_timeout) {
             Ok(stream) => {
                 stream
                     .set_nodelay(true)
                     .map_err(|_| SshError::Failed("failed setting nodelay"))?;
+                if !read_timeout.is_zero() {
+                    stream
+                        .set_read_timeout(Some(read_timeout))
+                        .map_err(|_| SshError::Failed("failed setting read timeout"))?;
+                }
                 return Ok(stream);
             }
             Err(e) => last_err = Some(e),
@@ -1124,18 +1996,25 @@ fn prompt_password() -> Result<String, SshError> {
 
 fn print_channel_output(client: &mut SshClient) -> Result<(), SshError> {
     loop {
-        let data = client.recv_data(NETNOX_SSH_MAX_DATA_LEN)?;
-        if data.is_empty() {
-            return Ok(());
+        match client.recv_data_with_timeout(NETNOX_SSH_MAX_DATA_LEN, 1000)? {
+            Some(data) if data.is_empty() => return Ok(()),
+            Some(data) => {
+                io::stdout().write_all(&data)?;
+                io::stdout().flush()?;
+            }
+            None => {
+                client.maybe_send_keepalive()?;
+            }
         }
-        io::stdout().write_all(&data)?;
-        io::stdout().flush()?;
     }
 }
 
 fn drain_shell_output(client: &mut SshClient, first_wait_ms: u64) -> Result<i32, SshError> {
     match client.recv_data_with_timeout(NETNOX_SSH_MAX_DATA_LEN, first_wait_ms)? {
-        None => Ok(0),
+        None => {
+            client.maybe_send_keepalive()?;
+            Ok(0)
+        }
         Some(data) if data.is_empty() => Ok(1),
         Some(data) => {
             io::stdout().write_all(&data)?;
@@ -1157,37 +2036,357 @@ fn drain_shell_output(client: &mut SshClient, first_wait_ms: u64) -> Result<i32,
 
 fn interactive_shell(client: &mut SshClient) -> Result<(), SshError> {
     println!("Interactive shell mode. Type 'exit' to quit.");
+    terminal::enable_raw_mode().map_err(|_| SshError::Failed("failed to enable raw mode"))?;
+    if let Ok((cols, rows)) = terminal::size() {
+        let _ = client.send_window_change(cols as u32, rows as u32);
+    }
+    let mut line_buf = String::new();
+    let result = (|| -> Result<(), SshError> {
+        loop {
+            let drain = drain_shell_output(client, 100)?;
+            if drain < 0 {
+                return Err(SshError::Failed("failed receiving shell output"));
+            }
+            if drain > 0 {
+                println!("Remote channel closed.");
+                return Ok(());
+            }
+
+            if !event::poll(Duration::from_millis(50))
+                .map_err(|_| SshError::Failed("event polling failed"))?
+            {
+                continue;
+            }
+
+            match event::read().map_err(|_| SshError::Failed("event read failed"))? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Enter => {
+                        if line_buf == "exit" {
+                            return Ok(());
+                        }
+                        line_buf.push('\n');
+                        client.send_data(line_buf.as_bytes())?;
+                        line_buf.clear();
+                    }
+                    KeyCode::Backspace => {
+                        line_buf.pop();
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        client.send_data(&[0x03])?;
+                    }
+                    KeyCode::Char(ch) => {
+                        line_buf.push(ch);
+                    }
+                    _ => {}
+                },
+                Event::Resize(cols, rows) => {
+                    let _ = client.send_window_change(cols as u32, rows as u32);
+                }
+                _ => {}
+            }
+        }
+    })();
+    let _ = terminal::disable_raw_mode();
+    result
+}
+
+fn run_local_forward(client: &mut SshClient, spec: &LocalForwardSpec) -> Result<(), SshError> {
+    let bind_addr = format!("127.0.0.1:{}", spec.listen_port);
+    let listener = TcpListener::bind(&bind_addr).map_err(SshError::Io)?;
+    println!(
+        "Local forward active: {} -> {}:{}",
+        bind_addr, spec.destination_host, spec.destination_port
+    );
+
     loop {
-        let drain = drain_shell_output(client, 250)?;
-        if drain < 0 {
-            return Err(SshError::Failed("failed receiving shell output"));
+        let (mut local, peer_addr) = listener.accept().map_err(SshError::Io)?;
+        client.open_direct_tcpip(
+            &spec.destination_host,
+            spec.destination_port,
+            &peer_addr.ip().to_string(),
+            peer_addr.port(),
+        )?;
+        forward_local_socket_over_channel(client, &mut local)?;
+    }
+}
+
+fn run_dynamic_forward(client: &mut SshClient, port: u16) -> Result<(), SshError> {
+    let bind_addr = format!("127.0.0.1:{port}");
+    let listener = TcpListener::bind(&bind_addr).map_err(SshError::Io)?;
+    println!("Dynamic SOCKS5 forward active on {bind_addr}");
+    loop {
+        let (mut local, peer_addr) = listener.accept().map_err(SshError::Io)?;
+        let (dst_host, dst_port) = socks5_handshake_and_target(&mut local)?;
+        client.open_direct_tcpip(
+            &dst_host,
+            dst_port,
+            &peer_addr.ip().to_string(),
+            peer_addr.port(),
+        )?;
+        forward_local_socket_over_channel(client, &mut local)?;
+    }
+}
+
+fn run_remote_forward(client: &mut SshClient, spec: &LocalForwardSpec) -> Result<(), SshError> {
+    client.request_remote_tcpip_forward("127.0.0.1", spec.listen_port)?;
+    println!(
+        "Remote forward active: remote 127.0.0.1:{} -> local {}:{}",
+        spec.listen_port, spec.destination_host, spec.destination_port
+    );
+
+    loop {
+        let Some(packet) = client.recv_packet_with_timeout(200)? else {
+            client.maybe_send_keepalive()?;
+            continue;
+        };
+        if packet.is_empty() {
+            continue;
         }
-        if drain > 0 {
-            println!("Remote channel closed.");
-            return Ok(());
+        if packet[0] != MSG_CHANNEL_OPEN {
+            continue;
         }
-        let mut line = String::new();
-        if io::stdin().read_line(&mut line)? == 0 {
-            return Ok(());
+        let mut off = 1usize;
+        let channel_type = read_ssh_string(&packet, &mut off)?;
+        if channel_type != b"forwarded-tcpip" {
+            continue;
         }
-        if line == "exit\n" || line == "exit\r\n" {
-            return Ok(());
+        let remote_sender_channel = read_u32_at(&packet, &mut off)?;
+        let remote_window = read_u32_at(&packet, &mut off)?;
+        let remote_max_packet = read_u32_at(&packet, &mut off)?;
+        let _connected_address = read_ssh_string(&packet, &mut off)?;
+        let _connected_port = read_u32_at(&packet, &mut off)?;
+        let _originator_address = read_ssh_string(&packet, &mut off)?;
+        let _originator_port = read_u32_at(&packet, &mut off)?;
+
+        let local_target = format!("{}:{}", spec.destination_host, spec.destination_port);
+        let mut local = TcpStream::connect(&local_target)
+            .map_err(|_| SshError::Failed("failed to connect local target for remote forward"))?;
+        local.set_read_timeout(Some(Duration::from_millis(50))).map_err(SshError::Io)?;
+        local
+            .set_write_timeout(Some(Duration::from_millis(2000)))
+            .map_err(SshError::Io)?;
+
+        let local_channel_id = client.next_local_channel_id;
+        client.next_local_channel_id = client.next_local_channel_id.wrapping_add(1);
+        let mut confirm = Vec::with_capacity(32);
+        confirm.push(MSG_CHANNEL_OPEN_CONFIRMATION);
+        push_u32(&mut confirm, remote_sender_channel);
+        push_u32(&mut confirm, local_channel_id);
+        push_u32(&mut confirm, NETNOX_SSH_CHANNEL_WINDOW_SIZE);
+        push_u32(&mut confirm, NETNOX_SSH_CHANNEL_MAX_PACKET_SIZE);
+        client.send_packet(&confirm)?;
+
+        client.local_channel_id = local_channel_id;
+        client.remote_channel_id = remote_sender_channel;
+        client.remote_window_size = remote_window;
+        client.remote_max_packet_size = remote_max_packet;
+        client.channel_open = true;
+        forward_local_socket_over_channel(client, &mut local)?;
+    }
+}
+
+fn socks5_handshake_and_target(stream: &mut TcpStream) -> Result<(String, u16), SshError> {
+    let mut head = [0u8; 2];
+    stream.read_exact(&mut head).map_err(SshError::Io)?;
+    if head[0] != 5 {
+        return Err(SshError::Failed("unsupported socks version"));
+    }
+    let method_count = head[1] as usize;
+    let mut methods = vec![0u8; method_count];
+    stream.read_exact(&mut methods).map_err(SshError::Io)?;
+    // no-auth only
+    stream.write_all(&[5, 0]).map_err(SshError::Io)?;
+
+    let mut req = [0u8; 4];
+    stream.read_exact(&mut req).map_err(SshError::Io)?;
+    if req[0] != 5 || req[1] != 1 {
+        return Err(SshError::Failed("unsupported socks command"));
+    }
+
+    let host = match req[3] {
+        1 => {
+            let mut ip = [0u8; 4];
+            stream.read_exact(&mut ip).map_err(SshError::Io)?;
+            format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
         }
-        client.send_data(line.as_bytes())?;
-        let drain = drain_shell_output(client, 300)?;
-        if drain < 0 {
-            return Err(SshError::Failed("failed receiving shell output"));
+        3 => {
+            let mut l = [0u8; 1];
+            stream.read_exact(&mut l).map_err(SshError::Io)?;
+            let mut buf = vec![0u8; l[0] as usize];
+            stream.read_exact(&mut buf).map_err(SshError::Io)?;
+            String::from_utf8_lossy(&buf).to_string()
         }
-        if drain > 0 {
-            println!("Remote channel closed.");
-            return Ok(());
+        4 => {
+            let mut ip = [0u8; 16];
+            stream.read_exact(&mut ip).map_err(SshError::Io)?;
+            let addr = std::net::Ipv6Addr::from(ip);
+            addr.to_string()
+        }
+        _ => return Err(SshError::Failed("unsupported socks address type")),
+    };
+
+    let mut port_buf = [0u8; 2];
+    stream.read_exact(&mut port_buf).map_err(SshError::Io)?;
+    let port = u16::from_be_bytes(port_buf);
+
+    // success response with 0.0.0.0:0 bind.
+    stream
+        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+        .map_err(SshError::Io)?;
+    Ok((host, port))
+}
+
+fn forward_local_socket_over_channel(
+    client: &mut SshClient,
+    local: &mut TcpStream,
+) -> Result<(), SshError> {
+    local
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .map_err(SshError::Io)?;
+    local
+        .set_write_timeout(Some(Duration::from_millis(2000)))
+        .map_err(SshError::Io)?;
+
+    let mut local_closed = false;
+    let mut local_buf = [0u8; NETNOX_SSH_MAX_DATA_LEN];
+    loop {
+        if !local_closed {
+            match local.read(&mut local_buf) {
+                Ok(0) => {
+                    local_closed = true;
+                }
+                Ok(n) => {
+                    client.send_data(&local_buf[..n])?;
+                }
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.kind() == io::ErrorKind::TimedOut => {}
+                Err(err) => return Err(SshError::Io(err)),
+            }
+        }
+
+        match client.recv_data_with_timeout(NETNOX_SSH_MAX_DATA_LEN, 50)? {
+            Some(data) if data.is_empty() => break,
+            Some(data) => local.write_all(&data).map_err(SshError::Io)?,
+            None => {
+                client.maybe_send_keepalive()?;
+                if local_closed {
+                    break;
+                }
+            }
         }
     }
+    let _ = local.shutdown(Shutdown::Both);
+    client.channel_open = false;
+    Ok(())
+}
+
+fn sftp_list_path(client: &mut SshClient, path: &str) -> Result<(), SshError> {
+    client.request_subsystem("sftp")?;
+
+    // INIT(version=3)
+    let mut init = Vec::with_capacity(9);
+    push_u32(&mut init, 5);
+    init.push(SFTP_MSG_INIT);
+    push_u32(&mut init, 3);
+    client.send_data(&init)?;
+
+    let mut sftp_buf = Vec::new();
+    let version_payload = recv_sftp_payload(client, &mut sftp_buf)?;
+    if version_payload.first().copied() != Some(SFTP_MSG_VERSION) {
+        return Err(SshError::Failed("invalid SFTP version response"));
+    }
+
+    let mut req = Vec::with_capacity(128);
+    let mut req_payload = Vec::with_capacity(120);
+    req_payload.push(SFTP_MSG_REALPATH);
+    push_u32(&mut req_payload, 1);
+    push_ssh_string(&mut req_payload, path.as_bytes());
+    push_u32(&mut req, req_payload.len() as u32);
+    req.extend_from_slice(&req_payload);
+    client.send_data(&req)?;
+
+    let reply = recv_sftp_payload(client, &mut sftp_buf)?;
+    match reply.first().copied() {
+        Some(SFTP_MSG_NAME) => {
+            let mut off = 1usize;
+            let _id = read_u32_at(&reply, &mut off)?;
+            let count = read_u32_at(&reply, &mut off)? as usize;
+            for _ in 0..count {
+                let filename = read_ssh_string(&reply, &mut off)?;
+                let _longname = read_ssh_string(&reply, &mut off)?;
+                skip_sftp_attrs(&reply, &mut off)?;
+                println!("{}", String::from_utf8_lossy(filename));
+            }
+            Ok(())
+        }
+        Some(SFTP_MSG_STATUS) => {
+            let mut off = 1usize;
+            let _id = read_u32_at(&reply, &mut off)?;
+            let code = read_u32_at(&reply, &mut off)?;
+            let msg = read_ssh_string(&reply, &mut off).unwrap_or(b"");
+            Err(SshError::FailedOwned(format!(
+                "sftp realpath failed: code={} message={}",
+                code,
+                String::from_utf8_lossy(msg)
+            )))
+        }
+        _ => Err(SshError::Failed("unexpected SFTP reply")),
+    }
+}
+
+fn recv_sftp_payload(client: &mut SshClient, pending: &mut Vec<u8>) -> Result<Vec<u8>, SshError> {
+    loop {
+        if pending.len() >= 4 {
+            let mut off = 0usize;
+            let packet_len = read_u32_at(pending, &mut off)? as usize;
+            if pending.len() >= packet_len + 4 {
+                let payload = pending[4..4 + packet_len].to_vec();
+                pending.drain(..4 + packet_len);
+                return Ok(payload);
+            }
+        }
+        let chunk = client.recv_data(NETNOX_SSH_MAX_DATA_LEN)?;
+        if chunk.is_empty() {
+            return Err(SshError::Failed("channel closed while reading SFTP packet"));
+        }
+        pending.extend_from_slice(&chunk);
+    }
+}
+
+fn skip_sftp_attrs(payload: &[u8], off: &mut usize) -> Result<(), SshError> {
+    let flags = read_u32_at(payload, off)?;
+    if flags & 0x0000_0001 != 0 {
+        // size (u64)
+        if *off + 8 > payload.len() {
+            return Err(SshError::Failed("invalid sftp attrs size"));
+        }
+        *off += 8;
+    }
+    if flags & 0x0000_0002 != 0 {
+        let _uid = read_u32_at(payload, off)?;
+        let _gid = read_u32_at(payload, off)?;
+    }
+    if flags & 0x0000_0004 != 0 {
+        let _perm = read_u32_at(payload, off)?;
+    }
+    if flags & 0x0000_0008 != 0 {
+        let _atime = read_u32_at(payload, off)?;
+        let _mtime = read_u32_at(payload, off)?;
+    }
+    if flags & 0x8000_0000 != 0 {
+        let ext_count = read_u32_at(payload, off)? as usize;
+        for _ in 0..ext_count {
+            let _etype = read_ssh_string(payload, off)?;
+            let _edata = read_ssh_string(payload, off)?;
+        }
+    }
+    Ok(())
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let opts = match parse_args(&args) {
+    let mut opts = match parse_args(&args) {
         Ok(v) => v,
         Err(_) => {
             print_usage(args.first().map_or("noxssh", String::as_str));
@@ -1203,15 +2402,21 @@ fn main() {
         unsafe { env::remove_var("NETNOX_SSH_DEBUG") };
     }
 
-    let (username, host) = match parse_target(&opts.target) {
+    let (mut username, host) = match parse_target(&opts.target) {
         Ok(v) => v,
         Err(_) => {
             eprintln!("ERROR: Invalid target: {}", opts.target);
             std::process::exit(1);
         }
     };
+    apply_ssh_host_config(&mut opts, &mut username, &host);
 
-    let stream = match connect_tcp(&host, opts.port) {
+    let stream = match connect_tcp(
+        &host,
+        opts.port,
+        Duration::from_millis(opts.connect_timeout_ms),
+        Duration::from_millis(opts.read_timeout_ms),
+    ) {
         Ok(s) => s,
         Err(_) => {
             eprintln!("ERROR: Failed TCP connect to {}:{}", host, opts.port);
@@ -1220,6 +2425,13 @@ fn main() {
     };
 
     let mut client = SshClient::new(stream, opts.port);
+    client.set_host_key_policy(opts.host_key_mode, opts.known_hosts_path.clone(), opts.batch_mode);
+    client.set_transport_timers(
+        Duration::from_millis(opts.keepalive_interval_ms),
+        Duration::from_secs(opts.rekey_interval_s),
+    );
+    client.set_identity_files(opts.identity_files.clone());
+    client.set_preferred_auth_methods(opts.preferred_auth_methods.clone());
     if let Err(err) = client.set_target(&username, &host) {
         eprintln!("ERROR: {err}");
         std::process::exit(1);
@@ -1263,6 +2475,34 @@ fn main() {
     }
     println!("Authentication succeeded.");
 
+    if let Some(spec) = opts.local_forward.as_ref() {
+        if let Err(err) = run_local_forward(&mut client, spec) {
+            eprintln!("ERROR: Local forwarding failed ({err}).");
+            client.close();
+            std::process::exit(1);
+        }
+        client.close();
+        return;
+    }
+    if let Some(port) = opts.dynamic_forward_port {
+        if let Err(err) = run_dynamic_forward(&mut client, port) {
+            eprintln!("ERROR: Dynamic forwarding failed ({err}).");
+            client.close();
+            std::process::exit(1);
+        }
+        client.close();
+        return;
+    }
+    if let Some(spec) = opts.remote_forward.as_ref() {
+        if let Err(err) = run_remote_forward(&mut client, spec) {
+            eprintln!("ERROR: Remote forwarding failed ({err}).");
+            client.close();
+            std::process::exit(1);
+        }
+        client.close();
+        return;
+    }
+
     if let Err(err) = client.open_session() {
         eprintln!("ERROR: Failed to open SSH session channel ({err}).");
         client.close();
@@ -1270,7 +2510,9 @@ fn main() {
     }
 
     // Command mode runs once and drains output; shell mode stays interactive.
-    let run_result = if let Some(command) = opts.command.as_deref() {
+    let run_result = if let Some(path) = opts.sftp_ls.as_deref() {
+        sftp_list_path(&mut client, path)
+    } else if let Some(command) = opts.command.as_deref() {
         client.exec(command).and_then(|_| print_channel_output(&mut client))
     } else {
         client
@@ -1285,4 +2527,60 @@ fn main() {
     }
 
     client.close();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_roundtrip() {
+        let input = b"ssh-test-binary-data";
+        let enc = base64_encode(input);
+        let dec = base64_decode(&enc).expect("base64 decode");
+        assert_eq!(dec, input);
+    }
+
+    #[test]
+    fn parse_target_user_host() {
+        let (u, h) = parse_target("alice@example.com").expect("parse target");
+        assert_eq!(u, "alice");
+        assert_eq!(h, "example.com");
+        let (u2, h2) = parse_target("example.com").expect("parse host only");
+        assert_eq!(u2, NOXSSH_DEFAULT_USER);
+        assert_eq!(h2, "example.com");
+    }
+
+    #[test]
+    fn parse_openssh_strict_host_key() {
+        let mut opts = CliOptions::default();
+        parse_openssh_option("StrictHostKeyChecking=accept-new", &mut opts).expect("parse -o");
+        assert_eq!(opts.host_key_mode, HostKeyCheckingMode::AcceptNew);
+    }
+
+    #[test]
+    fn parse_local_forward_variants() {
+        let spec = parse_local_forward_spec("8080:db.internal:5432").expect("parse explicit bind");
+        assert_eq!(spec.listen_port, 8080);
+        assert_eq!(spec.destination_host, "db.internal");
+        assert_eq!(spec.destination_port, 5432);
+
+        let spec2 = parse_local_forward_spec("db.internal:5432").expect("parse implicit bind");
+        assert_eq!(spec2.listen_port, 5432);
+        assert_eq!(spec2.destination_host, "db.internal");
+        assert_eq!(spec2.destination_port, 5432);
+    }
+
+    #[test]
+    fn base64_roundtrip_varied_lengths() {
+        for len in 0usize..128 {
+            let mut data = Vec::with_capacity(len);
+            for i in 0..len {
+                data.push(((i * 37 + 11) & 0xff) as u8);
+            }
+            let enc = base64_encode(&data);
+            let dec = base64_decode(&enc).expect("decode");
+            assert_eq!(dec, data, "mismatch at len={len}");
+        }
+    }
 }

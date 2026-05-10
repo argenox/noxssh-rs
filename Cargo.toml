@@ -13,4 +13,6 @@ rust-version = "1.75"
 
 [dependencies]
 noxtls-crypto = { path = "noxtls/crates/noxtls-crypto" }
+noxtls-x509 = { path = "noxtls/crates/noxtls-x509" }
 rpassword = "7"
+crossterm = "0.28"

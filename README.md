@@ -16,6 +16,10 @@
 - **Password authentication** — `ssh-userauth` with the `password` method
 - **Session channel** — Open `session` channel, **remote exec** or **interactive shell**
 - **PTY** — Optional `pty-req` before shell (disable with `-T`, similar to OpenSSH)
+- **Host key policy** — `known_hosts` verification with `strict`, `accept-new`, and `off` modes
+- **OpenSSH config compatibility (core)** — supports key directives from `~/.ssh/config` and `-o key=value` options
+- **Local forwarding** — `-L [bind_port:]host:hostport` via SSH `direct-tcpip`
+- **SFTP roundtrip** — `--sftp-ls <path>` initializes SFTP subsystem and lists canonical path entries
 - **Cross-platform** — Linux, macOS (Intel and Apple silicon), Windows (see [releases](#releases--ci-builds))
 
 ---
@@ -53,7 +57,7 @@ The binary is `target/release/noxssh` (on Windows, `target/release/noxssh.exe`).
 ## Usage
 
 ```text
-noxssh [-h] [-V] [-d|-dd|-ddd] [-T] [-p port] [-w password] [user@]host [command]
+noxssh [-h] [-V] [-d|-dd|-ddd] [-T] [-p port] [-w password] [-i identity_file] [-L [bind_port:]host:hostport] [-R [bind_port:]host:hostport] [-D port] [--sftp-ls path] [--strict-host-key-checking mode] [--known-hosts path] [--connect-timeout-ms ms] [--read-timeout-ms ms] [--server-alive-interval sec] [--batch-mode] [-o key=value] [user@]host [command]
 ```
 
 | Option | Meaning |
@@ -62,8 +66,19 @@ noxssh [-h] [-V] [-d|-dd|-ddd] [-T] [-p port] [-w password] [user@]host [command
 | `-V`, `--version` | Print application and NoxTLS versions |
 | `-p port` | SSH port (default: 22) |
 | `-w password` | Password on the command line (avoid in production) |
+| `-i identity_file` | Identity file path (`.pub` probing + auth ordering hooks) |
+| `-L [bind_port:]host:hostport` | Local forwarding tunnel (direct-tcpip) |
+| `-R [bind_port:]host:hostport` | Remote forwarding tunnel (tcpip-forward / forwarded-tcpip) |
+| `-D port` | Dynamic SOCKS5 local forwarding |
+| `--sftp-ls path` | Start SFTP subsystem and print canonical path entries |
 | `-T` | Do not request a PTY for shell mode |
 | `-d`, `-dd`, `-ddd` | Debug verbosity (`NETNOX_SSH_DEBUG` for compatibility) |
+| `--strict-host-key-checking` | `strict`, `accept-new`, or `off` host key behavior |
+| `--known-hosts path` | Override `known_hosts` file path |
+| `--connect-timeout-ms`, `--read-timeout-ms` | Network timeout controls |
+| `--server-alive-interval` | Keepalive interval in seconds |
+| `--batch-mode` | Disable interactive prompts (including TOFU host key trust) |
+| `-o key=value` | OpenSSH-style options (`StrictHostKeyChecking`, `UserKnownHostsFile`, `ConnectTimeout`, `ServerAliveInterval`, `BatchMode`, `PreferredAuthentications`) |
 
 If `user@` is omitted, the default username is **`user`**. Without `-w`, the client prompts for a password (hidden where the terminal supports it).
 
@@ -75,6 +90,10 @@ noxssh -p 2222 user@example.com
 noxssh user@example.com "uname -a"
 noxssh -w 'secret' user@example.com "hostname"
 noxssh -T user@example.com
+noxssh -L 15432:db.internal:5432 user@example.com
+noxssh -R 8080:127.0.0.1:8080 user@example.com
+noxssh -D 1080 user@example.com
+noxssh --sftp-ls /tmp user@example.com
 ```
 
 ### Run via Cargo
