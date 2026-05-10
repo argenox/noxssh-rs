@@ -3,6 +3,13 @@ name = "noxssh"
 version = "0.1.10"
 edition = "2021"
 build = "build.rs"
+authors = ["Argenox Technologies LLC"]
+license = "GPL-2.0-only OR LicenseRef-Argenox-Commercial-License"
+description = "Lightweight SSH-2 client in Rust using NoxTLS cryptographic primitives."
+readme = "README.md"
+keywords = ["ssh", "noxtls", "crypto", "client"]
+categories = ["command-line-utilities", "cryptography", "network-programming"]
+rust-version = "1.75"
 
 [dependencies]
 noxtls-crypto = { path = "noxtls/crates/noxtls-crypto" }
