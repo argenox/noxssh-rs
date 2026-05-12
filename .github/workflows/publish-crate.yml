@@ -1,7 +1,15 @@
 name: Publish Crate
 
+# Tag push `v*`: runs real `cargo publish` (publish job only; verify is skipped because event is `push`).
+# workflow_dispatch: dry-run by default; set `publish_to_crates_io` to true to run real publish from the selected ref.
+# pull_request: dry-run only.
 on:
   workflow_dispatch:
+    inputs:
+      publish_to_crates_io:
+        description: "If true, run cargo publish (requires CARGO_REGISTRY_TOKEN). If false, dry-run only."
+        type: boolean
+        default: false
   pull_request:
   push:
     tags:
@@ -13,6 +21,7 @@ permissions:
 jobs:
   verify-publish:
     name: Verify publish (dry-run)
+    # Skipped on tag pushes: those only run the real publish job below.
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
@@ -30,7 +39,10 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Runs on version tags, OR manual workflow with publish flag (branch ref is not refs/tags/v*).
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to_crates_io == 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
