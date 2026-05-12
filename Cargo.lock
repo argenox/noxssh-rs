@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "noxssh"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "crossterm",
  "noxtls-crypto",
@@ -100,25 +100,33 @@ dependencies = [
 
 [[package]]
 name = "noxtls-core"
-version = "0.1.0"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c18ea5ce009f6a93b6f934e14e6d7329f5fbbc38f9f0a90752586facf643de3"
 
 [[package]]
 name = "noxtls-crypto"
-version = "0.1.0"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd52ed12fff15915b015bb5999e6cc86ee0b0879ac78838deaf98b8782a10754"
 dependencies = [
  "noxtls-core",
 ]
 
 [[package]]
 name = "noxtls-pem"
-version = "0.1.0"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b814c47f628e2cf20f86457a2a13fcdfa475943a1d498d81df132bcd79d0e89e"
 dependencies = [
  "noxtls-core",
 ]
 
 [[package]]
 name = "noxtls-x509"
-version = "0.1.0"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a5b88ca46cfc8d241d1e27f252d7be57ba687760c5bf01632f11ff21521f279"
 dependencies = [
  "noxtls-core",
  "noxtls-crypto",

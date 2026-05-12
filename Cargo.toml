@@ -1,6 +1,6 @@
 [package]
 name = "noxssh"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 build = "build.rs"
 authors = ["Argenox Technologies LLC"]
@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "cryptography", "network-programming"]
 rust-version = "1.75"
 
 [dependencies]
-noxtls-crypto = { path = "noxtls/crates/noxtls-crypto" }
-noxtls-x509 = { path = "noxtls/crates/noxtls-x509" }
 rpassword = "7"
 crossterm = "0.28"
+noxtls-crypto = "0.1.3"
+noxtls-x509 = "0.1.3"

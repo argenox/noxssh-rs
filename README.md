@@ -1,6 +1,6 @@
 # noxssh-rs
 
-**noxssh-rs** is a small **SSH-2 client** written in Rust. It uses cryptographic primitives from the **[NoxTLS](https://github.com/argenox/noxtls)** stack (`noxtls-crypto` in this tree), not a third-party TLS or SSH library. The CLI and protocol scope are aligned with the C **[noxssh](https://github.com/argenox/noxssh)** reference client.
+**noxssh-rs** is a small **SSH-2 client** written in Rust. It uses cryptographic primitives from the **[NoxTLS](https://github.com/argenox/noxtls)** crates (`noxtls-crypto` / `noxtls-x509` from crates.io), not a third-party TLS or SSH library. The CLI and protocol scope are aligned with the C **[noxssh](https://github.com/argenox/noxssh)** reference client.
 
 | | |
 | --- | --- |
@@ -28,21 +28,13 @@
 ## Requirements
 
 - **Rust** toolchain **1.75** or newer ([rustup](https://rustup.rs/))
-- **Git** with submodule support
-- **noxtls** submodule — this repo expects `noxtls` as a git submodule (see `.gitmodules`). Initialize before building:
-
-```bash
-git submodule update --init --recursive
-```
-
-If your remote uses SSH for the submodule URL, ensure your SSH keys or HTTPS credentials are configured for that host.
+- **Git**
 
 ---
 
 ## Build from source
 
 ```bash
-git submodule update --init --recursive
 cargo build --release
 ```
 
@@ -51,7 +43,7 @@ The binary is `target/release/noxssh` (on Windows, `target/release/noxssh.exe`).
 ### Version strings
 
 - **Application version** comes from `Cargo.toml` (`[package].version`) and is shown with `-h`, `-V`, and in help output.
-- **NoxTLS library version** shown next to it is read at build time from `noxtls/crates/noxtls-crypto/Cargo.toml` (see `build.rs`).
+- **NoxTLS library version** shown next to it is read at build time from the locked dependency version in `Cargo.lock` (see `build.rs`).
 
 ---
 
@@ -105,33 +97,18 @@ cargo run --release -- [-h] [-V] [-d|-dd|-ddd] [-T] [-p port] [-w password] [use
 
 ---
 
-## Releases & CI builds
-
-GitHub Actions (`.github/workflows/build.yml`) builds **release** binaries for:
-
-- Linux `x86_64-unknown-linux-gnu`
-- macOS Intel `x86_64-apple-darwin`
-- macOS ARM `aarch64-apple-darwin`
-- Windows `x86_64-pc-windows-msvc`
-
-Artifacts are named with the **package version** from `Cargo.toml` (for example `noxssh-v0.1.10-<target>.exe`). Pushing a tag matching `v*` triggers attaching those artifacts to a GitHub Release.
-
-To cut a release: bump `[package].version` in `Cargo.toml`, commit, then create and push a tag (for example `v0.1.10`).
-
----
-
 ## Project layout
 
 ```text
 noxssh-rs/
 ├── src/main.rs           # CLI + SSH client implementation
-├── build.rs              # Injects NoxTLS version from submodule manifest
+├── build.rs              # Injects NoxTLS version from Cargo.lock
 ├── Cargo.toml            # Package version and metadata
 ├── LICENSE               # Full GPLv2 license text
 ├── LICENSE.md            # Dual licensing notice (GPL or commercial)
 ├── COPYING.md            # Pointer to GPLv2 text
 ├── .github/workflows/    # CI release builds
-└── noxtls/               # Git submodule — NoxTLS Rust crates
+└── src/ssh/              # SSH config + known_hosts modules
 ```
 
 ---

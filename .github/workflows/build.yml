@@ -38,12 +38,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure submodule URL for CI token auth
-        run: |
-          git config -f .gitmodules submodule.noxtls.url https://github.com/argenox/noxtls-rust-private.git
-          git submodule sync --recursive
-          git submodule update --init --recursive
-
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:

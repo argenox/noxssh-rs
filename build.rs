@@ -3,36 +3,53 @@ use std::path::PathBuf;
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
-    let noxtls_crypto_manifest = manifest_dir.join("noxtls/crates/noxtls-crypto/Cargo.toml");
+    let lock_path = manifest_dir.join("Cargo.lock");
+    println!("cargo:rerun-if-changed={}", lock_path.to_string_lossy());
 
-    println!(
-        "cargo:rerun-if-changed={}",
-        noxtls_crypto_manifest.to_string_lossy()
-    );
-
-    let noxtls_version = read_package_version(&noxtls_crypto_manifest).unwrap_or_else(|| "unknown".to_string());
+    let noxtls_version =
+        read_locked_dep_version(&lock_path, "noxtls-crypto").unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=NOXTLS_VERSION={noxtls_version}");
 }
 
-fn read_package_version(path: &PathBuf) -> Option<String> {
-    let content = fs::read_to_string(path).ok()?;
+fn read_locked_dep_version(lock_path: &PathBuf, dep_name: &str) -> Option<String> {
+    let content = fs::read_to_string(lock_path).ok()?;
     let mut in_package = false;
+    let mut current_name: Option<String> = None;
+    let mut current_version: Option<String> = None;
 
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_package = trimmed == "[package]";
+        if trimmed == "[[package]]" {
+            if in_package && current_name.as_deref() == Some(dep_name) {
+                return current_version;
+            }
+            in_package = true;
+            current_name = None;
+            current_version = None;
             continue;
         }
-        if in_package && trimmed.starts_with("version") {
-            let mut parts = trimmed.splitn(2, '=');
-            let _ = parts.next()?;
-            let value = parts.next()?.trim().trim_matches('"');
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
+        if !in_package {
+            continue;
+        }
+        if let Some(value) = parse_toml_string_field(trimmed, "name") {
+            current_name = Some(value);
+            continue;
+        }
+        if let Some(value) = parse_toml_string_field(trimmed, "version") {
+            current_version = Some(value);
         }
     }
 
+    if in_package && current_name.as_deref() == Some(dep_name) {
+        return current_version;
+    }
     None
+}
+
+fn parse_toml_string_field(line: &str, key: &str) -> Option<String> {
+    let (lhs, rhs) = line.split_once('=')?;
+    if lhs.trim() != key {
+        return None;
+    }
+    Some(rhs.trim().trim_matches('"').to_string())
 }
