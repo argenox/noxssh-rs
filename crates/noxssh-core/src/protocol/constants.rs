@@ -1,0 +1,70 @@
+pub const NETNOX_SSH_DEFAULT_PORT: u16 = 22;
+pub const NETNOX_SSH_DEFAULT_CLIENT_IDENT: &str = "SSH-2.0-noxssh_0.1";
+pub const NETNOX_SSH_DEFAULT_SERVER_IDENT: &str = "SSH-2.0-noxsshd_0.1";
+pub const NOXSSH_DEFAULT_USER: &str = "user";
+
+pub const NETNOX_SSH_MAX_IDENT_LEN: usize = 255;
+pub const NETNOX_SSH_MAX_BANNER_LINES: usize = 8;
+pub const NETNOX_SSH_MAX_USERNAME_LEN: usize = 64;
+pub const NETNOX_SSH_MAX_HOST_LEN: usize = 255;
+pub const NETNOX_SSH_MAX_COMMAND_LEN: usize = 512;
+pub const NETNOX_SSH_MAX_DATA_LEN: usize = 4096;
+pub const NETNOX_SSH_MAX_PACKET_LEN: usize = 35000;
+pub const NETNOX_SSH_MAX_KEXINIT_PAYLOAD_LEN: usize = 32768;
+pub const NETNOX_SSH_MAX_PASSWORD_LEN: usize = 128;
+pub const NETNOX_SSH_CHANNEL_WINDOW_SIZE: u32 = 65536;
+pub const NETNOX_SSH_CHANNEL_MAX_PACKET_SIZE: u32 = 32768;
+pub const NETNOX_SSH_MIN_PADDING_LEN: usize = 4;
+pub const NETNOX_SSH_KEXINIT_COOKIE_LEN: usize = 16;
+pub const NETNOX_SSH_AES_BLOCK_LEN: usize = 16;
+pub const NETNOX_SSH_MAC_LEN: usize = 32;
+
+pub const NETNOX_SSH_KEX_ALG_LIST: &str =
+    "mlkem768x25519-sha256,mlkem768-sha256,curve25519-sha256,diffie-hellman-group14-sha256";
+pub const NETNOX_SSH_HOST_KEY_ALG_LIST: &str = "ssh-ed25519,rsa-sha2-256,ssh-rsa";
+pub const NETNOX_SSH_CIPHER_ALG_LIST: &str = "aes128-ctr,aes256-ctr,chacha20-poly1305@openssh.com";
+pub const NETNOX_SSH_MAC_ALG_LIST: &str = "hmac-sha2-256,hmac-sha1";
+pub const NETNOX_SSH_COMPRESSION_ALG_LIST: &str = "none";
+pub const NETNOX_SSH_REQUIRED_KEX_ALG: &str = "curve25519-sha256";
+pub const SSH_KEX_MLKEM768_HYBRID: &str = "mlkem768x25519-sha256";
+pub const SSH_KEX_MLKEM768_NATIVE: &str = "mlkem768-sha256";
+
+pub const MSG_SERVICE_REQUEST: u8 = 5;
+pub const MSG_SERVICE_ACCEPT: u8 = 6;
+pub const MSG_IGNORE: u8 = 2;
+pub const MSG_KEXINIT: u8 = 20;
+pub const MSG_NEWKEYS: u8 = 21;
+pub const MSG_KEX_ECDH_INIT: u8 = 30;
+pub const MSG_KEX_ECDH_REPLY: u8 = 31;
+pub const MSG_USERAUTH_REQUEST: u8 = 50;
+pub const MSG_USERAUTH_FAILURE: u8 = 51;
+pub const MSG_USERAUTH_SUCCESS: u8 = 52;
+pub const MSG_USERAUTH_PK_OK: u8 = 60;
+pub const MSG_GLOBAL_REQUEST: u8 = 80;
+pub const MSG_REQUEST_SUCCESS: u8 = 81;
+pub const MSG_REQUEST_FAILURE: u8 = 82;
+pub const MSG_CHANNEL_OPEN: u8 = 90;
+pub const MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
+pub const MSG_CHANNEL_OPEN_FAILURE: u8 = 92;
+pub const MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
+pub const MSG_CHANNEL_DATA: u8 = 94;
+pub const MSG_CHANNEL_EXTENDED_DATA: u8 = 95;
+pub const MSG_CHANNEL_EOF: u8 = 96;
+pub const MSG_CHANNEL_CLOSE: u8 = 97;
+pub const MSG_CHANNEL_REQUEST: u8 = 98;
+pub const MSG_CHANNEL_SUCCESS: u8 = 99;
+pub const MSG_CHANNEL_FAILURE: u8 = 100;
+
+pub const SSH_SERVICE_USERAUTH: &str = "ssh-userauth";
+pub const SSH_SERVICE_CONNECTION: &str = "ssh-connection";
+pub const SSH_AUTH_METHOD_PASSWORD: &str = "password";
+pub const SSH_CHANNEL_TYPE_SESSION: &str = "session";
+pub const SSH_CHANNEL_REQ_EXEC: &str = "exec";
+pub const SSH_CHANNEL_REQ_SHELL: &str = "shell";
+pub const SSH_CHANNEL_REQ_SUBSYSTEM: &str = "subsystem";
+
+pub const SFTP_MSG_INIT: u8 = 1;
+pub const SFTP_MSG_VERSION: u8 = 2;
+pub const SFTP_MSG_REALPATH: u8 = 16;
+pub const SFTP_MSG_NAME: u8 = 104;
+pub const SFTP_MSG_STATUS: u8 = 101;

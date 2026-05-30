@@ -1,0 +1,14 @@
+﻿[package]
+name = "noxssh-shell"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Embedded command shell for noxssh server"
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+noxssh-core.workspace = true
+noxssh-server.workspace = true

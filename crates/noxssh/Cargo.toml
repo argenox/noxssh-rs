@@ -1,0 +1,24 @@
+﻿[package]
+name = "noxssh"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description.workspace = true
+readme.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "noxssh"
+path = "src/lib.rs"
+
+[dependencies]
+noxssh-core.workspace = true
+noxssh-client.workspace = true
+noxssh-server.workspace = true
+noxssh-shell.workspace = true

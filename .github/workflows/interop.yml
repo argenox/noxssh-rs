@@ -21,8 +21,8 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release binary
-        run: cargo build --locked --release
+      - name: Build release binaries
+        run: cargo build --locked --release -p noxssh-cli -p noxsshd
 
       - name: Install OpenSSH and Dropbear
         run: |
@@ -60,3 +60,16 @@ jobs:
       - name: Smoke test against Dropbear
         run: |
           ./target/release/noxssh -w noxpass -p 2223 --strict-host-key-checking accept-new noxuser@127.0.0.1 "echo dropbear-ok"
+
+      - name: Start noxsshd
+        run: |
+          ./target/release/noxsshd -p 2224 -u noxuser -w noxpass &
+          sleep 2
+
+      - name: Smoke test noxssh client against noxsshd
+        run: |
+          ./target/release/noxssh -w noxpass -p 2224 --strict-host-key-checking off noxuser@127.0.0.1 "echo noxsshd-ok"
+
+      - name: Smoke test OpenSSH client against noxsshd
+        run: |
+          ssh -p 2224 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null noxuser@127.0.0.1 echo openssh-to-noxsshd-ok

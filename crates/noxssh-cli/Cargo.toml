@@ -1,0 +1,21 @@
+﻿[package]
+name = "noxssh-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "noxssh command-line client"
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "noxssh"
+path = "src/main.rs"
+
+[dependencies]
+noxssh-core.workspace = true
+noxssh-client = { workspace = true, features = ["cli"] }
+crossterm.workspace = true
+rpassword.workspace = true

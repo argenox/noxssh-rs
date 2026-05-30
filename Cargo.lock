@@ -90,12 +90,64 @@ dependencies = [
 
 [[package]]
 name = "noxssh"
-version = "0.1.11"
+version = "0.2.0"
+dependencies = [
+ "noxssh-client",
+ "noxssh-core",
+ "noxssh-server",
+ "noxssh-shell",
+]
+
+[[package]]
+name = "noxssh-cli"
+version = "0.2.0"
 dependencies = [
  "crossterm",
+ "noxssh-client",
+ "noxssh-core",
+ "rpassword",
+]
+
+[[package]]
+name = "noxssh-client"
+version = "0.2.0"
+dependencies = [
+ "noxssh-core",
  "noxtls-crypto",
  "noxtls-x509",
  "rpassword",
+]
+
+[[package]]
+name = "noxssh-core"
+version = "0.2.0"
+dependencies = [
+ "noxtls-crypto",
+ "noxtls-x509",
+ "rpassword",
+]
+
+[[package]]
+name = "noxssh-server"
+version = "0.2.0"
+dependencies = [
+ "noxssh-core",
+]
+
+[[package]]
+name = "noxssh-shell"
+version = "0.2.0"
+dependencies = [
+ "noxssh-core",
+ "noxssh-server",
+]
+
+[[package]]
+name = "noxsshd"
+version = "0.2.0"
+dependencies = [
+ "noxssh-core",
+ "noxssh-server",
 ]
 
 [[package]]

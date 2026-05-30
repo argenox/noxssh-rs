@@ -1,0 +1,24 @@
+﻿[package]
+name = "noxssh-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+noxtls-crypto.workspace = true
+noxtls-x509.workspace = true
+
+[dependencies.rpassword]
+workspace = true
+optional = true
+
+[features]
+cli = ["rpassword"]

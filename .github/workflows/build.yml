@@ -47,26 +47,28 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          VERSION="$(awk '/^\[workspace.package\]/{found=1;next} found && /^version = /{gsub(/version = |"/,"",$0); print $0; exit}' Cargo.toml)"
           if [[ -z "$VERSION" ]]; then
             echo "Failed to determine version from Cargo.toml" >&2
             exit 1
           fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Build release binaries
+        run: cargo build --locked --release --target ${{ matrix.target }} -p noxssh-cli -p noxsshd
 
       - name: Run tests
-        run: cargo test --locked --target ${{ matrix.target }}
+        run: cargo test --locked --workspace --target ${{ matrix.target }}
 
-      - name: Prepare versioned binary
+      - name: Prepare versioned binaries
         shell: bash
         run: |
           mkdir -p dist
-          SOURCE="target/${{ matrix.target }}/release/noxssh${{ matrix.bin_suffix }}"
-          DEST="dist/noxssh-v${{ steps.version.outputs.value }}-${{ matrix.target }}${{ matrix.bin_suffix }}"
-          cp "$SOURCE" "$DEST"
+          for bin in noxssh noxsshd; do
+            SOURCE="target/${{ matrix.target }}/release/${bin}${{ matrix.bin_suffix }}"
+            DEST="dist/${bin}-v${{ steps.version.outputs.value }}-${{ matrix.target }}${{ matrix.bin_suffix }}"
+            cp "$SOURCE" "$DEST"
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
